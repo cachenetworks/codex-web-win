@@ -23,7 +23,7 @@ interface StoredThreadEnvironmentFile {
   threads: Record<string, StoredThreadEnvironment>;
 }
 
-const MAX_THREAD_ENVIRONMENTS = 256;
+const MAX_THREAD_ENVIRONMENTS = 512;
 const THREAD_ENVIRONMENT_TTL_MS = 30 * 24 * 60 * 60_000;
 const sharedStores = new Map<string, ChatGptThreadEnvironmentStore>();
 
@@ -106,6 +106,12 @@ function authority(environment: ChatGptTurnEnvironment, updatedAt: number): Stor
   };
 }
 
+function clientStorageKey(clientThreadId: string): string {
+  // Preserve legacy native thread-id keys so existing version-1 stores remain
+  // usable; the stable client identity is an additional alias only.
+  return `client:${clientThreadId}`;
+}
+
 /**
  * Codex emits its trusted environment envelope when a task starts or its environment changes,
  * not on every follow-up. This store carries only that trusted authority across turns. Tool
@@ -123,24 +129,38 @@ export class ChatGptThreadEnvironmentStore {
   resolve(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
     const identity = extractChatGptTurnIdentity(parsed);
     const storedForThread = identity.threadId ? this.get(identity.threadId) : undefined;
-    const parent = !storedForThread && identity.parentThreadId
+    const storedForClient = !storedForThread && identity.clientThreadId
+      ? this.get(clientStorageKey(identity.clientThreadId))
+      : undefined;
+    const parent = !storedForThread && !storedForClient && identity.parentThreadId
       ? this.get(identity.parentThreadId)
       : undefined;
     // Lineage proves where the child came from, not that it kept the same
     // permissions. Inherit only when current canonical policy independently
-    // proves equality; older implementation-only `sandbox` tags are ambiguous.
+    // proves equality; older implementation-only sandbox tags are ambiguous.
     const inheritedFromParent = parent
       && identity.sandboxType
       && identity.sandboxType === parent.sandboxPolicy.type
       ? parent
       : undefined;
-    const stored = storedForThread ?? inheritedFromParent;
+    const stored = storedForThread ?? storedForClient ?? inheritedFromParent;
+    const storedSource = storedForThread
+      ? "thread"
+      : storedForClient
+        ? "client"
+        : inheritedFromParent
+          ? "parent"
+          : "none";
+    console.info(
+      `[chatgpt-web] trusted environment store lookup: source=${storedSource} thread_id=${identity.threadId ? "present" : "missing"} client_thread_id=${identity.clientThreadId ? "present" : "missing"} parent_thread_id=${identity.parentThreadId ? "present" : "missing"}`,
+    );
     try {
       const environment = extractChatGptTurnEnvironment(parsed, stored);
       if (identity.threadId) this.set(identity.threadId, environment);
+      if (identity.clientThreadId) this.set(clientStorageKey(identity.clientThreadId), environment);
       return environment;
     } catch (error) {
-      if (!(error instanceof MissingTrustedCodexEnvironmentError) || !identity.threadId) throw error;
+      if (!(error instanceof MissingTrustedCodexEnvironmentError)) throw error;
       if (!stored) throw error;
       if (identity.sandboxType && identity.sandboxType !== stored.sandboxPolicy.type) {
         throw new Error("Codex sandbox policy changed without a trusted environment context");
@@ -152,11 +172,14 @@ export class ChatGptThreadEnvironmentStore {
         sandboxPolicy: stored.sandboxPolicy,
         tools: parsed.context.tools ?? [],
       };
-      if (identity.threadId && inheritedFromParent) this.set(identity.threadId, environment);
+      // A stable client alias can bridge a missing/rotated native thread id.
+      // Once a new native id appears, bind it to the same already-trusted
+      // authority rather than inventing cwd or permissions.
+      if (identity.threadId && !storedForThread) this.set(identity.threadId, environment);
+      if (identity.clientThreadId) this.set(clientStorageKey(identity.clientThreadId), environment);
       return environment;
     }
   }
-
   private get(threadId: string): StoredThreadEnvironment | undefined {
     this.load();
     const stored = this.threads.get(threadId);

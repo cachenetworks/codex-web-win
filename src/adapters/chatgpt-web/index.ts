@@ -4,7 +4,7 @@ import { expandUserPath, resolveBrokerSocketPath } from "../../config";
 import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexParsedRequest, type CodexProviderConfig, type CodexToolResultMessage, type CodexUsage } from "../../types";
 import { AdapterTurnError, type ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
-import { ChatGptBrowserWorker, DEFAULT_CHATGPT_TURN_TIMEOUT_MS } from "./browser-worker";
+import { ChatGptBrowserWorker, DEFAULT_CHATGPT_TOOL_TURN_TIMEOUT_MS, DEFAULT_CHATGPT_TURN_TIMEOUT_MS } from "./browser-worker";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "./environment";
 import { resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
@@ -12,6 +12,7 @@ import { TurnBroker, type BrokerToolRequest, type BrokerToolResult } from "./tur
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnExecutionKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
 import { estimateChatGptWebUsage } from "./usage";
 import { sharedChatGptThreadEnvironmentStore } from "./thread-environment";
+const CHATGPT_POST_TOOL_YIELD_MS = 650;
 
 function brokerSocketPath(provider: CodexProviderConfig): string {
   return resolveBrokerSocketPath(provider.chatgptWeb?.brokerSocketPath);
@@ -185,16 +186,95 @@ function appendTextToActiveRound(
   });
 }
 
-function currentToolResults(parsed: CodexParsedRequest, session: ChatGptTurnSession): CodexToolResultMessage[] {
-  const byId = new Map<string, CodexToolResultMessage>();
-  for (const message of parsed.context.messages) {
-    if (message.role !== "toolResult" || !session.hasOutstanding(message.toolCallId)) continue;
-    if (byId.has(message.toolCallId)) throw new Error(`Codex returned duplicate results for tool call ${message.toolCallId}`);
-    byId.set(message.toolCallId, message);
-  }
-  return [...byId.values()];
+interface CurrentToolResultGroup {
+  toolCallId: string;
+  messages: CodexToolResultMessage[];
 }
 
+function currentToolResultGroups(
+  parsed: CodexParsedRequest,
+  session: ChatGptTurnSession,
+): CurrentToolResultGroup[] {
+  const byId = new Map<string, CodexToolResultMessage[]>();
+  let historicalReplayCount = 0;
+
+  for (const message of parsed.context.messages) {
+    if (message.role !== "toolResult") continue;
+
+    // Results for calls already delivered in an earlier provider round are
+    // replay history. They are already represented in the browser-side tool
+    // conversation and cannot be completed again because the broker invocation
+    // has been resolved. Do not confuse that with pruning current results.
+    if (!session.hasOutstanding(message.toolCallId)) {
+      historicalReplayCount++;
+      continue;
+    }
+
+    const group = byId.get(message.toolCallId);
+    if (group) group.push(message);
+    else byId.set(message.toolCallId, [message]);
+  }
+
+  const groups = [...byId.entries()].map(([toolCallId, messages]) => ({
+    toolCallId,
+    messages,
+  }));
+
+  const multiResultGroups = groups.filter(group => group.messages.length > 1);
+  if (multiResultGroups.length > 0) {
+    console.warn(
+      `[chatgpt-web] preserving all Codex tool-result variants for ${multiResultGroups.length} outstanding call(s): `
+      + multiResultGroups.map(group => `${group.toolCallId.slice(0, 17)}=${group.messages.length}`).join(", "),
+    );
+  }
+  if (historicalReplayCount > 0) {
+    console.info(
+      `[chatgpt-web] observed ${historicalReplayCount} historical tool-result replay message(s) for calls already completed`,
+    );
+  }
+
+  return groups;
+}
+
+function brokerResultGroup(group: CurrentToolResultGroup): BrokerToolResult {
+  if (group.messages.length === 1) return brokerResult(group.messages[0]!);
+
+  const content: unknown[] = [];
+  const total = group.messages.length;
+
+  content.push({
+    type: "text",
+    text:
+      `[Bridge note: Codex supplied ${total} result messages for this single tool call. `
+      + "No result payload was discarded; every variant follows in original context order.]",
+  });
+
+  group.messages.forEach((message, index) => {
+    const wireName = namespacedToolName(message.toolNamespace, message.toolName);
+    content.push({
+      type: "text",
+      text:
+        `[Codex result ${index + 1}/${total}; tool=${wireName}; `
+        + `status=${message.isError ? "error" : "success"}; timestamp=${message.timestamp}]`,
+    });
+    content.push(...brokerContent(message.content));
+  });
+
+  const errorCount = group.messages.filter(message => message.isError).length;
+  return {
+    content,
+    // Mixed success/error variants are preserved as normal content so the model
+    // can inspect every observation instead of the whole composite being
+    // collapsed into a generic tool failure. Mark error only if ALL variants
+    // are errors.
+    ...(errorCount === total ? { isError: true } : {}),
+    _meta: {
+      codexResultCount: total,
+      codexErrorResultCount: errorCount,
+      preservedAllResultVariants: true,
+    },
+  };
+}
 function validateBatchTools(parsed: CodexParsedRequest, requests: BrokerToolRequest[]): void {
   const available = new Set((parsed.context.tools ?? []).map(tool => namespacedToolName(tool.namespace, tool.name)));
   for (const request of requests) {
@@ -208,6 +288,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const broker = TurnBroker.forSocket(brokerSocketPath(provider));
   const timeoutMs = provider.chatgptWeb?.turnTimeoutMs ?? DEFAULT_CHATGPT_TURN_TIMEOUT_MS;
+  const toolTimeoutMs = Math.max(timeoutMs, DEFAULT_CHATGPT_TOOL_TURN_TIMEOUT_MS);
   const capabilities: ChatGptWebCapabilities = {
     localToolsEnabled: provider.chatgptWeb?.localToolsEnabled === true,
     proAvailable: provider.chatgptWeb?.proAvailable === true,
@@ -231,7 +312,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
     } catch (error) {
       const identity = extractChatGptTurnIdentity(parsed);
       console.warn(
-        `[chatgpt-web] trusted environment unavailable (thread_id=${identity.threadId ? "present" : "missing"}, turn_id=${identity.turnId ? "present" : "missing"}, previous_response_id=${parsed.previousResponseId ?? "none"}, replay_prefix_items=${parsed._replayPrefixLen ?? 0}, context_messages=${parsed.context.messages.length})`,
+        `[chatgpt-web] trusted environment unavailable (thread_id=${identity.threadId ? "present" : "missing"}, client_thread_id=${identity.clientThreadId ? "present" : "missing"}, turn_id=${identity.turnId ? "present" : "missing"}, previous_response_id=${parsed.previousResponseId ?? "none"}, replay_prefix_items=${parsed._replayPrefixLen ?? 0}, context_messages=${parsed.context.messages.length})`,
       );
       throw error;
     }
@@ -276,7 +357,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       reasoning: parsed.options.reasoning,
       capabilities,
       prepare: async () => {
-        const turnToken = await broker.register(environment, timeoutMs + 60_000, traceId);
+        const turnToken = await broker.register(environment, toolTimeoutMs + 60_000, traceId);
         activeToken = turnToken;
         tokenSettled = true;
         token.resolve(turnToken);
@@ -361,20 +442,52 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
 
             const outstanding = session.outstanding();
             if (outstanding.length > 0) {
-              const results = currentToolResults(parsed, session);
-              if (results.length === 0) {
+              const resultGroups = currentToolResultGroups(parsed, session);
+              if (resultGroups.length === 0) {
                 const reasoning = session.reasoningForOutstandingReplay();
                 replayEvents(session.eventsForOutstandingReplay(), emit);
-                emitToolBatch(outstanding, estimateChatGptWebUsage(parsed, { reasoning, toolRequests: outstanding }, capabilities), emit);
+                emitToolBatch(
+                  outstanding,
+                  estimateChatGptWebUsage(parsed, { reasoning, toolRequests: outstanding }, capabilities),
+                  emit,
+                );
                 return;
               }
-              if (results.length !== outstanding.length) {
-                throw new Error(`Codex returned ${results.length} of ${outstanding.length} results for a parallel ChatGPT tool batch`);
+
+              // Deliver every payload variant observed for each current call as
+              // one composite broker completion. The broker protocol resolves
+              // one pending Promise per call id, so this preserves all content
+              // without inventing duplicate tool invocations.
+              for (const group of resultGroups) {
+                broker.completeTool(turnToken, group.toolCallId, brokerResultGroup(group));
+                session.markResultDelivered(group.toolCallId);
               }
-              for (const message of results) {
-                broker.completeTool(turnToken, message.toolCallId, brokerResult(message));
-                session.markResultDelivered(message.toolCallId);
+
+              // Codex can reconstruct parallel tool batches incrementally.
+              // Consume whichever results are present and replay only the calls
+              // that are genuinely still outstanding instead of requiring the
+              // whole parallel batch to arrive in one request.
+              const remaining = session.outstanding();
+              if (remaining.length > 0) {
+                const reasoning = session.reasoningForOutstandingReplay();
+                replayEvents(session.eventsForOutstandingReplay(), emit);
+                emitToolBatch(
+                  remaining,
+                  estimateChatGptWebUsage(parsed, { reasoning, toolRequests: remaining }, capabilities),
+                  emit,
+                );
+                return;
               }
+
+              // The broker completions above have already returned the real
+              // local results to ChatGPT. Pause only before accepting a NEW
+              // substantive batch so the browser model gets an old-style
+              // continuation/commentary opportunity instead of immediately
+              // disappearing into another silent tool round.
+              console.info(
+                "[chatgpt-web] completed Codex tool batch; yielding to ChatGPT for visible commentary before the next tool batch",
+              );
+              await new Promise(resolveYield => setTimeout(resolveYield, CHATGPT_POST_TOOL_YIELD_MS));
             }
           } else if (session.outstanding().length > 0) {
             throw new Error("Read-only ChatGPT Web runtime cannot own local tool calls");
@@ -387,6 +500,9 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
             const emitNewText = (deltas: string[]) => appendTextToActiveRound(session, deltas, emit);
             emitNewTrace(session.runtime.trace.drain());
             emitNewText(session.runtime.text.drain());
+            if (session.runtime.mode === "tools") {
+              console.info("[chatgpt-web] draining browser continuation after tool-result yield");
+            }
             const stagedTools = session.stagedTools();
             const nextTools = turnToken
               ? stagedTools.length > 0

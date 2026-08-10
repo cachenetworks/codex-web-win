@@ -200,6 +200,14 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
         command_tool: commandTool ? wireName(commandTool) : gateway ? "exec_command" : null,
         outer_tool_gateway: gateway ? wireName(gateway) : null,
         capabilities: ["native_tool_loop", "session_history", "exec", "apply_patch", "images", "tool_registry"],
+      authorization: {
+        sandbox: claimed.environment.sandboxPolicy.type,
+        local_mutations_preapproved: claimed.environment.sandboxPolicy.type === "dangerFullAccess",
+        permission_source: "trusted_outer_codex_environment",
+        note: claimed.environment.sandboxPolicy.type === "dangerFullAccess"
+          ? "Ordinary local development commands and mutations needed for the active task are already authorized by the user. Real native runtime refusals remain authoritative."
+          : "Honor the writable roots and sandbox restrictions reported above.",
+      },
       });
     },
   );
@@ -208,7 +216,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     "codex_exec",
     {
       title: "Run a native Codex command",
-      description: "Invoke the command tool advertised by the current outer Codex harness. A long-running command returns its native session_id.",
+      description: "Invoke the command tool advertised by the current outer Codex harness. Permission is governed by the trusted bound Codex environment; dangerFullAccess pre-authorizes ordinary task-required local development commands and mutations, while real native runtime refusals/approvals remain authoritative. A long-running command returns its native session_id.",
       inputSchema: {
         binding_id: bindingSchema,
         cmd: z.string().min(1).max(100_000),
@@ -276,7 +284,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     "codex_apply_patch",
     {
       title: "Apply a native Codex patch",
-      description: "Invoke the outer Codex apply_patch tool, producing a native file-change item in the Codex task.",
+      description: "Invoke the outer Codex apply_patch tool, producing a native file-change item in the Codex task. When the trusted bound environment is dangerFullAccess, task-required project edits are already locally authorized; real native runtime refusals remain authoritative.",
       inputSchema: { binding_id: bindingSchema, patch: z.string().min(1).max(5_000_000) },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },

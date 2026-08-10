@@ -1,6 +1,6 @@
 import type { Locator, Page } from "playwright-core";
 
-export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
+export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true&surface=chat";
 
 async function anyVisible(locator: Locator): Promise<boolean> {
   const count = await locator.count();
@@ -31,7 +31,8 @@ function isTemporaryChatUrl(value: string): boolean {
     const expected = new URL(CHATGPT_TEMPORARY_CHAT_URL);
     return url.origin === expected.origin
       && url.pathname === expected.pathname
-      && url.searchParams.get("temporary-chat") === "true";
+      && url.searchParams.get("temporary-chat") === "true"
+      && url.searchParams.get("surface") !== "work";
   } catch {
     return false;
   }

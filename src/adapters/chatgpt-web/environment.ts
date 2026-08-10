@@ -2,7 +2,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { CodexParsedRequest, CodexTool } from "../../types";
 
-const ENVIRONMENT_RESOLVER_REVISION = "rev6-2026-08-08";
+const ENVIRONMENT_RESOLVER_REVISION = "rev7-2026-08-08";
 
 export type ChatGptSandboxPolicy =
   | { type: "dangerFullAccess" }
@@ -18,6 +18,8 @@ export interface ChatGptTurnEnvironment {
 }
 export interface ChatGptTurnIdentity {
   threadId?: string;
+  /** Stable proxy-derived client identity used when native Codex thread_id is absent or rotates. */
+  clientThreadId?: string;
   parentThreadId?: string;
   turnId?: string;
   promptCacheKey?: string;
@@ -512,8 +514,12 @@ export function extractChatGptTurnIdentity(parsed: CodexParsedRequest): ChatGptT
   const body = record(parsed._rawBody);
   const metadata = clientTurnMetadata(parsed);
   const sandboxType = canonicalMetadataSandboxType(metadata) ?? legacyPolicySandboxType(metadata);
+  const clientThreadId = typeof parsed._clientThreadId === "string"
+    ? parsed._clientThreadId.trim()
+    : "";
   return {
     ...(typeof metadata?.thread_id === "string" ? { threadId: metadata.thread_id } : {}),
+    ...(clientThreadId ? { clientThreadId } : {}),
     ...(typeof metadata?.parent_thread_id === "string"
       ? { parentThreadId: metadata.parent_thread_id }
       : typeof metadata?.forked_from_thread_id === "string"

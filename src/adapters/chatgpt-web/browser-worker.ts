@@ -15,6 +15,8 @@ import { childProcessEnvironment } from "../../process";
 const workers = new Map<string, ChatGptBrowserWorker>();
 
 export const DEFAULT_CHATGPT_TURN_TIMEOUT_MS = 40 * 60_000;
+export const DEFAULT_CHATGPT_TOOL_TURN_TIMEOUT_MS = 3 * 60 * 60_000;
+const MAX_CHATGPT_DELIVERY_TIMEOUT_RECOVERIES = 6;
 export const CHATGPT_RESPONSE_DOM_GRACE_MS = 30_000;
 export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000;
 
@@ -93,6 +95,14 @@ export class ChatGptTurnDomHealthTracker {
   constructor(
     private readonly missingResponseMs = CHATGPT_RESPONSE_DOM_GRACE_MS,
     private readonly emptyCompletionMs = CHATGPT_EMPTY_RESPONSE_GRACE_MS,
+    /**
+     * Connector/tool turns may legitimately execute for a long time before
+     * ChatGPT creates its first assistant conversation-turn DOM node.
+     *
+     * This relaxes ONLY the initial-absence check. Once a response DOM has
+     * appeared, losing it still uses the normal missingResponseMs watchdog.
+     */
+    private readonly allowInitialMissingResponse = false,
   ) {}
 
   update(state: {
@@ -104,13 +114,19 @@ export class ChatGptTurnDomHealthTracker {
     if (state.responsePresent) {
       this.sawResponse = true;
       this.missingResponseSince = undefined;
-    } else {
+    } else if (!this.allowInitialMissingResponse || this.sawResponse) {
       this.missingResponseSince ??= now;
       if (now - this.missingResponseSince >= this.missingResponseMs) {
         return this.sawResponse
           ? "ChatGPT response DOM disappeared while the browser turn was active"
           : "ChatGPT did not create a response DOM after the message was sent";
       }
+    } else {
+      // A tool-capable ChatGPT turn can remain in a page-level "Thinking"
+      // state while Codex Native executes commands before the first assistant
+      // conversation-turn node exists. Do not turn that valid pre-response
+      // phase into a false DOM-health failure.
+      this.missingResponseSince = undefined;
     }
 
     const emptyCompletion = state.responsePresent
@@ -482,6 +498,133 @@ export class ChatGptBrowserWorker {
     return page;
   }
 
+  /**
+   * ChatGPT now has separate Chat and Work surfaces. This browser adapter must
+   * always operate in regular Chat: Work has separate quotas/behavior and can
+   * silently become the remembered/default surface.
+   */
+  private async ensureRegularChatSurface(page: Page): Promise<void> {
+    const pageIsWork = async (): Promise<boolean> => {
+      try {
+        const url = new URL(page.url());
+        if (url.searchParams.get("surface") === "work") return true;
+      } catch {}
+
+      const workQuota = page.getByText(/(?:out of|remaining).*Work usage|Work usage.*(?:reset|remaining)/i);
+      const quotaCount = await workQuota.count().catch(() => 0);
+      for (let index = 0; index < quotaCount; index++) {
+        if (await workQuota.nth(index).isVisible().catch(() => false)) return true;
+      }
+
+      const controls = page.locator("button, [role='tab'], [role='radio']");
+      const count = await controls.count().catch(() => 0);
+      for (let index = 0; index < count; index++) {
+        const control = controls.nth(index);
+        if (!await control.isVisible().catch(() => false)) continue;
+        const state = await control.evaluate(element => {
+          const html = element as HTMLElement;
+          const text = (html.innerText || html.textContent || "").replace(/\s+/g, " ").trim();
+          const rect = html.getBoundingClientRect();
+          const selected = html.getAttribute("aria-selected") === "true"
+            || html.getAttribute("aria-pressed") === "true"
+            || html.getAttribute("data-state") === "active"
+            || html.getAttribute("data-state") === "checked";
+          return { text, selected, top: rect.top, bottom: rect.bottom };
+        }).catch(() => undefined);
+        if (state?.text === "Work" && state.selected && state.top >= 0 && state.bottom <= 350) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const temporaryChatIsPresent = (): boolean => {
+      try {
+        return new URL(page.url()).searchParams.get("temporary-chat") === "true";
+      } catch {
+        return false;
+      }
+    };
+
+    const clickChatToggle = async (): Promise<boolean> => {
+      const candidates = [
+        page.getByRole("button", { name: "Chat", exact: true }),
+        page.getByRole("tab", { name: "Chat", exact: true }),
+        page.getByRole("radio", { name: "Chat", exact: true }),
+        page.getByText("Chat", { exact: true }),
+      ];
+
+      for (const locator of candidates) {
+        const count = await locator.count().catch(() => 0);
+        for (let index = 0; index < count; index++) {
+          const candidate = locator.nth(index);
+          if (!await candidate.isVisible().catch(() => false)) continue;
+          const usable = await candidate.evaluate(element => {
+            const html = element as HTMLElement;
+            const rect = html.getBoundingClientRect();
+            const text = (html.innerText || html.textContent || "").replace(/\s+/g, " ").trim();
+            // The Chat/Work switch is at the top of the product surface. This
+            // avoids accidentally clicking chat text from a transcript/sidebar.
+            return text === "Chat"
+              && rect.width > 0
+              && rect.height > 0
+              && rect.top >= 0
+              && rect.bottom <= 350;
+          }).catch(() => false);
+          if (!usable) continue;
+          await candidate.click({ timeout: 5_000 }).catch(() => {});
+          return true;
+        }
+      }
+      return false;
+    };
+
+    // A URL can be rewritten by the SPA after navigation. Give it a few bounded
+    // repair passes: correct Work -> Chat, then restore temporary-chat if the
+    // surface switch dropped that query parameter.
+    for (let pass = 0; pass < 3; pass++) {
+      const work = await pageIsWork();
+      const temporary = temporaryChatIsPresent();
+
+      if (!work && temporary) {
+        console.info(`[chatgpt-web] Chat surface confirmed url=${page.url()}`);
+        return;
+      }
+
+      if (work) {
+        console.info(`[chatgpt-web] Work surface detected; switching to regular Chat (url=${page.url()})`);
+        if (!await clickChatToggle()) {
+          throw new Error(`ChatGPT opened Work and the regular Chat toggle could not be selected (url=${page.url()})`);
+        }
+
+        const deadline = Date.now() + 8_000;
+        while (Date.now() < deadline) {
+          if (!await pageIsWork()) break;
+          await page.waitForTimeout(100);
+        }
+        if (await pageIsWork()) {
+          throw new Error(`ChatGPT remained on Work after selecting Chat (url=${page.url()})`);
+        }
+      }
+
+      if (!temporaryChatIsPresent()) {
+        console.info("[chatgpt-web] restoring Temporary Chat after Chat/Work surface correction");
+        await page.goto(CHATGPT_TEMPORARY_CHAT_URL, {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        });
+        await page.waitForTimeout(250);
+      }
+    }
+
+    if (await pageIsWork()) {
+      throw new Error(`ChatGPT redirected back to Work instead of regular Chat (url=${page.url()})`);
+    }
+    if (!temporaryChatIsPresent()) {
+      throw new Error(`ChatGPT regular Chat opened without Temporary Chat isolation (url=${page.url()})`);
+    }
+  }
+
   private async selectModelAndEffort(
     page: Page,
     modelId: string,
@@ -617,8 +760,8 @@ export class ChatGptBrowserWorker {
       ].join(", ")),
       // Current ChatGPT can render the committed inline pill alongside the
       // textbox, in the message-action shell rather than beneath the
-      // contenteditable node. Only accept its explicit inline-pill markers at
-      // page scope: generic plugin cards elsewhere must never look selected.
+      // contenteditable node. Explicit inline-pill markers remain the strongest
+      // page-scope signal.
       page.locator([
         "[data-inline-selection-pill]",
         "[data-inline-selection-pill-cursor-target]",
@@ -648,9 +791,120 @@ export class ChatGptBrowserWorker {
         if (state && chatGptConnectorSelectionMatches({ ...state, names, visible }, this.config.appName)) return true;
       }
     }
-    return false;
-  }
 
+    // Current ChatGPT Plugins shell can represent a committed connector as a
+    // label next to data-testid="plugins-button" instead of an inline mention
+    // under the contenteditable. The reported DOM is effectively:
+    //   Plugins | [icon "C"] Codex Native
+    //
+    // Scope this fallback to the smallest visible ancestor shared by the
+    // active composer and a nearby Plugins button. Popup/menu/floating rows are
+    // excluded so an uncommitted autocomplete result cannot authorize sending.
+    return composer.evaluate((composerElement, appName) => {
+      const composerHtml = composerElement as HTMLElement;
+      const normalizeName = (value: string): string =>
+        value.replace(/\s+/g, " ").trim().replace(/^@\s*/, "").toLowerCase();
+      const target = normalizeName(appName);
+      const visibleElement = (value: HTMLElement): boolean => {
+        const style = getComputedStyle(value);
+        const rect = value.getBoundingClientRect();
+        return style.display !== "none"
+          && style.visibility !== "hidden"
+          && style.opacity !== "0"
+          && rect.width > 0
+          && rect.height > 0;
+      };
+      const gap = (left: DOMRect, right: DOMRect): number => {
+        const horizontal = Math.max(0, left.left - right.right, right.left - left.right);
+        const vertical = Math.max(0, left.top - right.bottom, right.top - left.bottom);
+        return Math.hypot(horizontal, vertical);
+      };
+      const candidateNames = (part: HTMLElement): string[] => {
+        const withoutDecoration = part.cloneNode(true) as HTMLElement;
+        withoutDecoration.querySelectorAll<HTMLElement>([
+          "[data-testid*='icon']",
+          '[aria-hidden="true"]',
+          "svg",
+          "img",
+        ].join(", ")).forEach(icon => icon.remove());
+        return [
+          part.getAttribute("aria-label") ?? "",
+          part.getAttribute("title") ?? "",
+          part.innerText ?? "",
+          part.textContent ?? "",
+          withoutDecoration.innerText ?? "",
+          withoutDecoration.textContent ?? "",
+        ].filter(Boolean);
+      };
+      const excludedSelector = [
+        "[role='listbox']",
+        "[role='menu']",
+        "[role='dialog']",
+        "[popover]",
+        "[data-radix-popper-content-wrapper]",
+        "[data-floating-ui-portal]",
+        "[data-testid*='autocomplete']",
+        "[data-testid*='mention-menu']",
+        "[data-testid*='connector-menu']",
+        "[data-testid*='plugin-menu']",
+        "nav",
+        "aside",
+        "section[data-testid^='conversation-turn-']",
+        "[data-testid*='sidebar']",
+      ].join(", ");
+
+      const composerRect = composerHtml.getBoundingClientRect();
+      const pluginButtons = [...document.querySelectorAll<HTMLElement>(
+        "[data-testid='plugins-button'], [data-testid*='plugins-button']",
+      )].filter(visibleElement);
+
+      for (const pluginsButton of pluginButtons) {
+        if (gap(pluginsButton.getBoundingClientRect(), composerRect) > 400) continue;
+
+        let shell: HTMLElement | null = pluginsButton.parentElement;
+        while (shell && shell !== document.body && !shell.contains(composerHtml)) {
+          shell = shell.parentElement;
+        }
+        if (!shell || shell === document.body || shell === document.documentElement || !visibleElement(shell)) continue;
+
+        const shellRect = shell.getBoundingClientRect();
+        if (shellRect.height > Math.max(600, composerRect.height + 450)) continue;
+
+        const parts = shell.querySelectorAll<HTMLElement>([
+          "span",
+          "button",
+          "a",
+          "[data-inline-selection-pill]",
+          "[data-inline-selection-pill-cursor-target]",
+          "[data-testid*='plugin']",
+          "[data-testid*='connector']",
+          "[contenteditable='false']",
+          "[aria-label]",
+          "[title]",
+        ].join(", "));
+        for (const part of parts) {
+          if (!visibleElement(part) || part === pluginsButton) continue;
+          if (part.closest(excludedSelector)) continue;
+          if (gap(part.getBoundingClientRect(), composerRect) > 400) continue;
+
+          let ancestor = part.parentElement;
+          let floating = false;
+          while (ancestor && ancestor !== shell) {
+            const position = getComputedStyle(ancestor).position;
+            if (position === "absolute" || position === "fixed") {
+              floating = true;
+              break;
+            }
+            ancestor = ancestor.parentElement;
+          }
+          if (floating) continue;
+
+          if (candidateNames(part).some(name => normalizeName(name) === target)) return true;
+        }
+      }
+      return false;
+    }, this.config.appName).catch(() => false);
+  }
   private async waitForConnectorSelected(page: Page, composer: Locator, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -801,14 +1055,332 @@ export class ChatGptBrowserWorker {
     return undefined;
   }
 
-  private async waitForConnectorSuggestion(page: Page, timeoutMs: number): Promise<Locator | undefined> {
+  private async waitForConnectorResolution(
+    page: Page,
+    composer: Locator,
+    timeoutMs: number,
+  ): Promise<{ selected: true } | { suggestion: Locator } | undefined> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (await this.connectorIsSelected(page, composer)) return { selected: true };
       const candidate = await this.visibleConnectorSuggestion(page);
-      if (candidate) return candidate;
+      if (candidate) return { suggestion: candidate };
       await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
     }
+    // Close the race where ChatGPT commits the plugin at the polling deadline.
+    if (await this.connectorIsSelected(page, composer)) return { selected: true };
     return undefined;
+  }
+  /**
+   * Locate Codex Native inside the popup opened by ChatGPT's Plugins button.
+   * This path is required by ChatGPT builds that no longer expose @connector
+   * autocomplete at all.
+   */
+  private async visiblePluginsPickerConnector(page: Page, composer: Locator): Promise<Locator | undefined> {
+    const candidates: Array<{ locator: Locator; accessibleNameMatched: boolean }> = [
+      { locator: page.getByRole("menuitem", { name: this.config.appName, exact: true }), accessibleNameMatched: true },
+      { locator: page.getByRole("menuitemradio", { name: this.config.appName, exact: true }), accessibleNameMatched: true },
+      { locator: page.getByRole("option", { name: this.config.appName, exact: true }), accessibleNameMatched: true },
+      { locator: page.getByRole("button", { name: this.config.appName, exact: true }), accessibleNameMatched: true },
+      { locator: page.getByRole("link", { name: this.config.appName, exact: true }), accessibleNameMatched: true },
+      { locator: page.getByRole("menuitem").filter({ hasText: this.config.appName }), accessibleNameMatched: false },
+      { locator: page.getByRole("option").filter({ hasText: this.config.appName }), accessibleNameMatched: false },
+      { locator: page.locator("button, a, [role='listitem']").filter({ hasText: this.config.appName }), accessibleNameMatched: false },
+      { locator: page.getByText(this.config.appName, { exact: true }), accessibleNameMatched: false },
+    ];
+
+    for (const { locator, accessibleNameMatched } of candidates) {
+      const count = await locator.count().catch(() => 0);
+      for (let index = count - 1; index >= Math.max(0, count - 50); index--) {
+        const candidate = locator.nth(index);
+        const visible = await candidate.isVisible().catch(() => false);
+        if (!visible) continue;
+
+        const names = await candidate.evaluate(connectorCandidateNames).catch(() => [] as string[]);
+        if (!accessibleNameMatched
+          && !names.some(name => connectorNameMatches(name, this.config.appName))) {
+          continue;
+        }
+
+        const state = await candidate.evaluate(element => {
+          const html = element as HTMLElement;
+          const visibleElement = (value: HTMLElement): boolean => {
+            const style = getComputedStyle(value);
+            const rect = value.getBoundingClientRect();
+            return style.display !== "none"
+              && style.visibility !== "hidden"
+              && style.opacity !== "0"
+              && rect.width > 0
+              && rect.height > 0;
+          };
+          const composer = document.querySelector<HTMLElement>([
+            "#prompt-textarea",
+            '[role="textbox"][aria-label="Chat with ChatGPT"]',
+            '[contenteditable="true"][aria-label="Chat with ChatGPT"]',
+          ].join(", "));
+          const popupSelector = [
+            "[role='listbox']",
+            "[role='menu']",
+            "[role='dialog']",
+            "[popover]",
+            "[data-radix-popper-content-wrapper]",
+            "[data-floating-ui-portal]",
+            "[data-testid*='plugin-menu']",
+            "[data-testid*='connector-menu']",
+            "[data-testid*='picker']",
+            "[data-testid*='popover']",
+            "[data-state='open']",
+          ].join(", ");
+
+          let popup = html.closest<HTMLElement>(popupSelector);
+          if (!popup) {
+            let ancestor = html.parentElement;
+            while (ancestor && ancestor !== document.body) {
+              const style = getComputedStyle(ancestor);
+              if ((style.position === "absolute" || style.position === "fixed")
+                && visibleElement(ancestor)) {
+                popup = ancestor;
+                break;
+              }
+              ancestor = ancestor.parentElement;
+            }
+          }
+
+          const pluginsButton = html.closest("[data-testid='plugins-button'], [data-testid*='plugins-button']");
+          const excluded = html.closest([
+            "nav",
+            "aside",
+            "section[data-testid^='conversation-turn-']",
+            "[data-testid*='sidebar']",
+          ].join(", ")) !== null;
+          const rect = (popup ?? html).getBoundingClientRect();
+          const composerRect = composer?.getBoundingClientRect();
+          const horizontalGap = composerRect
+            ? Math.max(0, composerRect.left - rect.right, rect.left - composerRect.right)
+            : Number.POSITIVE_INFINITY;
+          const verticalGap = composerRect
+            ? Math.max(0, composerRect.top - rect.bottom, rect.top - composerRect.bottom)
+            : Number.POSITIVE_INFINITY;
+
+          return {
+            inPopup: popup !== null && visibleElement(popup),
+            isPluginsButton: pluginsButton !== null,
+            excluded,
+            containsComposer: composer ? html.contains(composer) : false,
+            insideComposer: composer ? composer.contains(html) : false,
+            nearComposer: horizontalGap <= 900 && verticalGap <= 900,
+          };
+        }).catch(() => undefined);
+
+        if (!state
+          || !state.inPopup
+          || state.isPluginsButton
+          || state.excluded
+          || state.containsComposer
+          || state.insideComposer
+          || !state.nearComposer) {
+          continue;
+        }
+        return candidate;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Prefer ChatGPT's explicit Plugins picker. The @mention path is retained
+   * only as a compatibility fallback for older UI revisions.
+   */
+  private async selectConnectorViaPluginsButton(page: Page, composer: Locator): Promise<boolean> {
+    if (await this.connectorIsSelected(page, composer)) return true;
+
+    const buttons = page.locator(
+      "[data-testid='plugins-button'], [data-testid*='plugins-button']",
+    );
+    const count = await buttons.count().catch(() => 0);
+    for (let index = count - 1; index >= 0; index--) {
+      const pluginsButton = buttons.nth(index);
+      if (!await pluginsButton.isVisible().catch(() => false)) continue;
+
+      const nearComposer = await pluginsButton.evaluate(button => {
+        const composer = document.querySelector<HTMLElement>([
+          "#prompt-textarea",
+          '[role="textbox"][aria-label="Chat with ChatGPT"]',
+          '[contenteditable="true"][aria-label="Chat with ChatGPT"]',
+        ].join(", "));
+        if (!composer) return false;
+        const left = (button as HTMLElement).getBoundingClientRect();
+        const right = composer.getBoundingClientRect();
+        const horizontal = Math.max(0, left.left - right.right, right.left - left.right);
+        const vertical = Math.max(0, left.top - right.bottom, right.top - left.bottom);
+        return Math.hypot(horizontal, vertical) <= 500;
+      }).catch(() => false);
+      if (!nearComposer) continue;
+
+      await page.keyboard.press("Escape").catch(() => {});
+      await composer.fill("");
+      await pluginsButton.click({ timeout: 5_000 }).catch(() => {});
+      if (await this.waitForConnectorSelected(page, composer, 1_000)) return true;
+
+      const deadline = Date.now() + 8_000;
+      while (Date.now() < deadline) {
+        const connector = await this.visiblePluginsPickerConnector(page, composer);
+        if (connector) {
+          await connector.click({ timeout: 5_000 }).catch(() => {});
+          if (await this.waitForConnectorSelected(page, composer, 5_000)) return true;
+
+          console.info(
+            `[chatgpt-web] Plugins picker clicked ${JSON.stringify(this.config.appName)} but committed connector state was not detected; visible connector UI=${await this.connectorSelectionDiagnostic(page)}`,
+          );
+
+          // Some revisions keep the picker open while updating composer state.
+          // Close it and probe the committed shell one more time.
+          await page.keyboard.press("Escape").catch(() => {});
+          if (await this.waitForConnectorSelected(page, composer, 1_500)) return true;
+          break;
+        }
+        await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
+      }
+
+      console.info(
+        `[chatgpt-web] Plugins picker did not expose a usable ${JSON.stringify(this.config.appName)} item; visible connector UI=${await this.connectorSelectionDiagnostic(page)}`,
+      );
+      await page.keyboard.press("Escape").catch(() => {});
+    }
+    return false;
+  }
+
+  /**
+   * Reproduce the connector-selection sequence that works manually in the
+   * current ChatGPT UI: type @Codex Native, wait for its popup row, click that
+   * row, then verify committed connector state before any Codex context is
+   * inserted into the composer.
+   */
+  private async visibleMentionConnectorPopupTarget(page: Page, composer: Locator): Promise<Locator | undefined> {
+    const candidates: Locator[] = [
+      page.getByRole("option", { name: this.config.appName, exact: true }),
+      page.getByRole("menuitem", { name: this.config.appName, exact: true }),
+      page.getByRole("menuitemradio", { name: this.config.appName, exact: true }),
+      page.getByRole("button", { name: this.config.appName, exact: true }),
+      page.getByRole("link", { name: this.config.appName, exact: true }),
+      page.getByText(this.config.appName, { exact: true }),
+    ];
+
+    for (const locator of candidates) {
+      const count = await locator.count().catch(() => 0);
+      for (let index = count - 1; index >= Math.max(0, count - 60); index--) {
+        const candidate = locator.nth(index);
+        if (!await candidate.isVisible().catch(() => false)) continue;
+
+        const usable = await candidate.evaluate((element, appName) => {
+          const html = element as HTMLElement;
+          const normalizeName = (value: string): string =>
+            value.replace(/\s+/g, " ").trim().replace(/^@\s*/, "").toLowerCase();
+          const target = normalizeName(appName);
+          const visible = (value: HTMLElement): boolean => {
+            const style = getComputedStyle(value);
+            const rect = value.getBoundingClientRect();
+            return style.display !== "none"
+              && style.visibility !== "hidden"
+              && style.opacity !== "0"
+              && rect.width > 0
+              && rect.height > 0;
+          };
+          const composerElement = document.querySelector<HTMLElement>([
+            "#prompt-textarea",
+            '[role="textbox"][aria-label="Chat with ChatGPT"]',
+            '[contenteditable="true"][aria-label="Chat with ChatGPT"]',
+          ].join(", "));
+          if (!composerElement || composerElement.contains(html)) return false;
+          if (html.closest([
+            "nav",
+            "aside",
+            "section[data-testid^='conversation-turn-']",
+            "[data-testid*='sidebar']",
+          ].join(", "))) return false;
+
+          const ownNames = [
+            html.getAttribute("aria-label") ?? "",
+            html.getAttribute("title") ?? "",
+            html.innerText ?? "",
+            html.textContent ?? "",
+          ].map(normalizeName).filter(Boolean);
+          if (!ownNames.some(name => name === target)) return false;
+
+          const popupSelector = [
+            "[role='listbox']",
+            "[role='menu']",
+            "[role='dialog']",
+            "[popover]",
+            "[data-radix-popper-content-wrapper]",
+            "[data-floating-ui-portal]",
+            "[data-testid*='autocomplete']",
+            "[data-testid*='mention-menu']",
+            "[data-testid*='connector-menu']",
+            "[data-testid*='plugin-menu']",
+            "[data-testid*='picker']",
+          ].join(", ");
+
+          let popup = html.closest<HTMLElement>(popupSelector);
+          if (!popup) {
+            let ancestor = html.parentElement;
+            while (ancestor && ancestor !== document.body) {
+              const style = getComputedStyle(ancestor);
+              if ((style.position === "absolute" || style.position === "fixed") && visible(ancestor)) {
+                popup = ancestor;
+                break;
+              }
+              ancestor = ancestor.parentElement;
+            }
+          }
+          if (!popup || !visible(popup)) return false;
+
+          const rect = popup.getBoundingClientRect();
+          const composerRect = composerElement.getBoundingClientRect();
+          const horizontalGap = Math.max(0, composerRect.left - rect.right, rect.left - composerRect.right);
+          const verticalGap = Math.max(0, composerRect.top - rect.bottom, rect.top - composerRect.bottom);
+          return horizontalGap <= 900 && verticalGap <= 900;
+        }, this.config.appName).catch(() => false);
+
+        if (usable) return candidate;
+      }
+    }
+    return undefined;
+  }
+
+  private async clickMentionConnectorPopupTarget(page: Page, target: Locator): Promise<boolean> {
+    // First use a normal Playwright click so ChatGPT receives the same pointer
+    // sequence as a user click. If a wrapper intercepts it, click the visible
+    // label's center as a bounded manual-equivalent fallback.
+    try {
+      await target.click({ timeout: 4_000 });
+      return true;
+    } catch {}
+
+    const box = await target.boundingBox().catch(() => null);
+    if (!box || box.width <= 0 || box.height <= 0) return false;
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    return true;
+  }
+
+  private async waitForManualMentionSelection(page: Page, composer: Locator, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    let clicked = false;
+    while (Date.now() < deadline) {
+      if (await this.connectorIsSelected(page, composer)) return true;
+
+      const target = await this.visibleMentionConnectorPopupTarget(page, composer);
+      if (target && !clicked) {
+        console.info(`[chatgpt-web] connector automation: ${this.config.appName} popup row detected; clicking it`);
+        clicked = await this.clickMentionConnectorPopupTarget(page, target);
+        if (clicked) {
+          const selected = await this.waitForConnectorSelected(page, composer, 6_000);
+          if (selected) return true;
+        }
+      }
+      await page.waitForTimeout(100);
+    }
+    return this.connectorIsSelected(page, composer);
   }
 
   private async connectorSelectionDiagnostic(page: Page): Promise<string> {
@@ -852,51 +1424,43 @@ export class ChatGptBrowserWorker {
 
   private async selectConnector(page: Page, composer: Locator): Promise<void> {
     for (let attempt = 1; attempt <= 2; attempt++) {
+      await page.keyboard.press("Escape").catch(() => {});
       await composer.fill("");
       await composer.focus();
-      // Real key events reliably open the current mention autocomplete, while
-      // the UI is also allowed to auto-convert the text directly into a pill.
-      await page.keyboard.type(`@${this.config.appName}`, { delay: 10 });
 
-      // This is the path shown in the reported failure: the connector is
-      // already selected, so waiting only for the obsolete role=group row
-      // causes a false timeout.
-      if (await this.waitForConnectorSelected(page, composer, 2_000)) return;
+      // IMPORTANT: this deliberately mirrors the sequence confirmed to work
+      // manually on the user's current ChatGPT build. Do not open Plugins first.
+      await page.keyboard.type(`@${this.config.appName}`, { delay: 25 });
+      console.info(`[chatgpt-web] connector automation: typed @${this.config.appName}; waiting for popup selection before context insertion`);
 
-      const suggestion = await this.waitForConnectorSuggestion(page, 10_000);
+      if (await this.waitForManualMentionSelection(page, composer, 15_000)) {
+        console.info(`[chatgpt-web] connector automation: ${this.config.appName} committed; context insertion may begin`);
+        return;
+      }
+
+      // Keep the older generalized suggestion detector only as a fallback for
+      // minor DOM revisions. It is never allowed to cause raw @mention submit.
+      const suggestion = await this.visibleConnectorSuggestion(page);
       if (suggestion) {
-        await suggestion.click({ timeout: 5_000 }).catch(() => {});
-        if (await this.waitForConnectorSelected(page, composer, 5_000)) return;
-
-        // Keyboard selection is a compatibility fallback for popup rows whose
-        // pointer handler is obscured by a transient overlay. Enter is used
-        // only while the same scoped autocomplete row is still visible, so a
-        // raw @mention is never deliberately submitted as a message.
-        if (await suggestion.isVisible().catch(() => false)) {
-          await composer.focus();
-          await page.keyboard.press("ArrowDown");
-          if (await suggestion.isVisible().catch(() => false)) {
-            await page.keyboard.press("Enter");
-            if (await this.waitForConnectorSelected(page, composer, 5_000)) return;
-          }
+        await suggestion.click({ timeout: 4_000 }).catch(() => {});
+        if (await this.waitForConnectorSelected(page, composer, 5_000)) {
+          console.info(`[chatgpt-web] connector automation: ${this.config.appName} committed through fallback suggestion detector`);
+          return;
         }
       }
 
       await page.keyboard.press("Escape").catch(() => {});
-      if (attempt < 2) await new Promise(resolveSleep => setTimeout(resolveSleep, 300));
+      if (attempt < 2) await page.waitForTimeout(400);
     }
 
     const diagnostic = await this.connectorSelectionDiagnostic(page);
-    // Leave no raw mention in the composer when selection failed. The caller
-    // also throws before reaching the only send path.
     await composer.fill("").catch(() => {});
     throw new Error(
       `ChatGPT could not select connector ${JSON.stringify(this.config.appName)}`
-      + "; the mention UI neither produced a detectable inline pill nor a clickable autocomplete result"
+      + "; bridge typed the @mention but could not click/confirm its popup row before context insertion"
       + (diagnostic !== "[]" ? `; visible connector UI=${diagnostic}` : ""),
     );
   }
-
   private async attachPrompt(page: Page, prompt: string, localTools: boolean): Promise<void> {
     const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" });
     await composer.waitFor({ state: "visible", timeout: 20_000 });
@@ -906,13 +1470,23 @@ export class ChatGptBrowserWorker {
       return;
     }
 
+    // selectConnector() must finish the @mention -> popup click -> committed
+    // plugin handshake before the very large transported Codex context is put
+    // into the contenteditable. This is the ordering that works manually.
     await this.selectConnector(page, composer);
+    if (!await this.connectorIsSelected(page, composer)) {
+      throw new Error(
+        `ChatGPT connector ${JSON.stringify(this.config.appName)} was not committed before Codex context insertion`,
+      );
+    }
+
+    console.info(`[chatgpt-web] connector automation: inserting Codex context after committed plugin (chars=${prompt.length})`);
     await composer.focus();
     await page.keyboard.press("End");
     await page.keyboard.insertText(` ${prompt}`);
     await this.assertPromptAttached(page, prompt);
+    console.info("[chatgpt-web] connector automation: Codex context insertion verified");
   }
-
   private async attachFiles(page: Page, prompt: CompiledChatGptWebPrompt): Promise<void> {
     const files = chatGptPromptFilePayloads(prompt);
     if (files.length === 0) return;
@@ -1078,6 +1652,58 @@ export class ChatGptBrowserWorker {
     );
   }
 
+  private async recoverMessageDeliveryTimeout(
+    page: Page,
+    attempt: number,
+  ): Promise<boolean> {
+    const timeoutMessage = page.getByText(
+      /Message delivery timed out\. Please try again\./i,
+    ).last();
+    if (!await timeoutMessage.isVisible().catch(() => false)) return false;
+
+    if (attempt >= MAX_CHATGPT_DELIVERY_TIMEOUT_RECOVERIES) {
+      throw new Error(
+        "ChatGPT message delivery repeatedly timed out after "
+        + String(attempt)
+        + " automatic recoveries",
+      );
+    }
+
+    const retry = page.getByRole("button", { name: "Retry", exact: true }).last();
+    if (!await retry.isVisible().catch(() => false)) {
+      throw new Error(
+        "ChatGPT reported a message delivery timeout but did not expose its Retry button",
+      );
+    }
+
+    console.warn(
+      "[chatgpt-web] ChatGPT message delivery timed out; clicking Retry automatically "
+      + "(recovery "
+      + String(attempt + 1)
+      + "/"
+      + String(MAX_CHATGPT_DELIVERY_TIMEOUT_RECOVERIES)
+      + ")",
+    );
+
+    await retry.click({ timeout: 5_000 });
+
+    const recoveryDeadline = Date.now() + 20_000;
+    while (Date.now() < recoveryDeadline) {
+      const timeoutStillVisible = await timeoutMessage.isVisible().catch(() => false);
+      const retryStillVisible = await retry.isVisible().catch(() => false);
+      const stopVisible = await page.getByRole("button", { name: "Stop answering" })
+        .isVisible()
+        .catch(() => false);
+      if (!timeoutStillVisible && (!retryStillVisible || stopVisible)) {
+        console.info("[chatgpt-web] ChatGPT delivery Retry was accepted; browser turn is active again");
+        return true;
+      }
+      await page.waitForTimeout(100);
+    }
+
+    throw new Error("ChatGPT Retry did not clear the message delivery timeout state");
+  }
+
   private async handleToolConfirmation(page: Page): Promise<boolean> {
     const heading = page.getByText(`Allow ChatGPT to use ${this.config.appName}?`, { exact: true }).last();
     if (!await heading.isVisible().catch(() => false)) return false;
@@ -1197,13 +1823,16 @@ export class ChatGptBrowserWorker {
     try {
       if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       const estimatedInputTokens = estimateCompiledChatGptWebInputTokens(prepared, turn.modelId);
-      const deadline = Date.now() + this.config.turnTimeoutMs;
+      let deadline = Date.now() + this.config.turnTimeoutMs;
       const page = await this.runStage(turn.traceId, "browser_page", browserStageTimeouts.browserPage, () => this.pageForNewTurn());
       console.info(
         `[chatgpt-web] browser turn ${turn.traceId} opened (transport=inline, promptChars=${prepared.text.length}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length})`,
       );
       await this.runStage(turn.traceId, "temporary_chat_navigation", browserStageTimeouts.navigation, () => (
         page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 }).then(() => undefined)
+      ));
+      await this.runStage(turn.traceId, "chat_surface_selection", browserStageTimeouts.navigation, () => (
+        this.ensureRegularChatSurface(page)
       ));
       const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" });
       try {
@@ -1220,6 +1849,17 @@ export class ChatGptBrowserWorker {
       const mode = await this.runStage(turn.traceId, "effort_selection", browserStageTimeouts.effortSelection, () => (
         this.selectModelAndEffort(page, turn.modelId, turn.reasoning, turn.capabilities)
       ));
+      if (mode.localTools) {
+        deadline = Date.now() + Math.max(
+          this.config.turnTimeoutMs,
+          DEFAULT_CHATGPT_TOOL_TURN_TIMEOUT_MS,
+        );
+        console.info(
+          "[chatgpt-web] tool-capable browser turn lifetime="
+          + String(Math.round((deadline - Date.now()) / 60_000))
+          + "m",
+        );
+      }
       await this.runStage(turn.traceId, "prompt_attachment", browserStageTimeouts.promptAttachment, () => (
         this.attachPrompt(page, prepared.text, mode.localTools)
       ));
@@ -1243,18 +1883,47 @@ export class ChatGptBrowserWorker {
       let finalText = "";
       let sawRunning = false;
       let loggedCompletionWait = false;
-      const sentAt = Date.now();
-      const visibleTrace = new ChatGptVisibleTraceTracker();
-      const markdownStream = new ChatGptMarkdownStream(stripChatGptTransportMarkers);
-      const completionTracker = new ChatGptCompletionTracker();
-      const domHealthTracker = new ChatGptTurnDomHealthTracker();
+      let loggedInitialToolDomWait = false;
+      let deliveryTimeoutRecoveries = 0;
+      let sentAt = Date.now();
+      let visibleTrace = new ChatGptVisibleTraceTracker();
+      let markdownStream = new ChatGptMarkdownStream(stripChatGptTransportMarkers);
+      let completionTracker = new ChatGptCompletionTracker();
+      let domHealthTracker = new ChatGptTurnDomHealthTracker(
+        CHATGPT_RESPONSE_DOM_GRACE_MS,
+        CHATGPT_EMPTY_RESPONSE_GRACE_MS,
+        mode.localTools,
+      );
       for (;;) {
         if (turn.abortSignal?.aborted) {
           const stop = page.getByRole("button", { name: "Stop answering" });
           if (await stop.isVisible().catch(() => false)) await stop.click().catch(() => {});
           throw new DOMException("ChatGPT web turn aborted", "AbortError");
         }
-        if (Date.now() >= deadline) throw new Error("ChatGPT web turn timed out");
+
+        if (mode.localTools
+          && await this.recoverMessageDeliveryTimeout(page, deliveryTimeoutRecoveries)) {
+          deliveryTimeoutRecoveries += 1;
+          finalText = "";
+          sawRunning = false;
+          loggedCompletionWait = false;
+          loggedInitialToolDomWait = false;
+          sentAt = Date.now();
+          visibleTrace = new ChatGptVisibleTraceTracker();
+          markdownStream = new ChatGptMarkdownStream(stripChatGptTransportMarkers);
+          completionTracker = new ChatGptCompletionTracker();
+          domHealthTracker = new ChatGptTurnDomHealthTracker(
+            CHATGPT_RESPONSE_DOM_GRACE_MS,
+            CHATGPT_EMPTY_RESPONSE_GRACE_MS,
+            true,
+          );
+          await page.waitForTimeout(250);
+          continue;
+        }
+
+        if (Date.now() >= deadline) {
+          throw new Error("ChatGPT web tool turn exceeded its absolute browser lifetime");
+        }
         if (Date.now() - lastHeartbeat >= 10_000) {
           turn.onHeartbeat?.();
           lastHeartbeat = Date.now();
@@ -1321,6 +1990,17 @@ export class ChatGptBrowserWorker {
             completionActionVisible: false,
           });
           if (domError) throw new Error(domError);
+
+          if (mode.localTools
+            && !loggedInitialToolDomWait
+            && Date.now() - sentAt >= CHATGPT_RESPONSE_DOM_GRACE_MS) {
+            loggedInitialToolDomWait = true;
+            console.info(
+              "[chatgpt-web] browser turn "
+              + turn.traceId
+              + " is still active before first assistant DOM; allowing Codex Native tool phase to continue",
+            );
+          }
         }
         await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
       }
