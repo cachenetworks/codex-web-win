@@ -343,7 +343,11 @@ try {
   const persistenceBefore = await windowsPersistenceSnapshot();
   const homeBefore = treeSnapshot(appHome);
 
-  const about = await run(gui, ["--about-json"], { env: environment, cwd: relocated, timeoutMs: 7_500 });
+  // Freshly relocated Windows executables can spend several seconds in Defender/
+  // SmartScreen inspection before user code starts. Keep the probe bounded, but
+  // give cold binaries enough room to start on ordinary Windows installations.
+  const coldStartTimeoutMs = 20_000;
+  const about = await run(gui, ["--about-json"], { env: environment, cwd: relocated, timeoutMs: coldStartTimeoutMs });
   assert(about.exitCode === 0, `--about-json failed (${about.exitCode}): ${about.stderr}`);
   assert(!`${about.stdout}\n${about.stderr}`.includes(secretCanary), "--about-json disclosed a secret canary");
   const metadata = parseSingleJson(about.stdout, "--about-json");
@@ -356,7 +360,7 @@ try {
   assert(normalized(String(metadata.root)) === normalized(relocated), "--about-json root does not match the relocated bundle");
   assert(normalized(String(metadata.cliPath)) === normalized(launcher), "--about-json cliPath does not resolve to the relocated sibling launcher");
 
-  const launcherVersion = await run(launcher, ["--version"], { env: environment, cwd: relocated, timeoutMs: 7_500 });
+  const launcherVersion = await run(launcher, ["--version"], { env: environment, cwd: relocated, timeoutMs: coldStartTimeoutMs });
   assert(launcherVersion.exitCode === 0, `launcher --version failed (${launcherVersion.exitCode}): ${launcherVersion.stderr}`);
   assert(launcherVersion.stdout.trim() === manifest.appVersion, "launcher stdout was not forwarded from the bundled runtime");
   assert(!`${launcherVersion.stdout}\n${launcherVersion.stderr}`.includes(secretCanary), "launcher --version disclosed a secret canary");

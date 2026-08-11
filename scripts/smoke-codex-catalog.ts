@@ -54,7 +54,11 @@ function runCodex(args: string[], env = process.env): { stdout: string; stderr: 
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     env,
-    timeout: 15_000,
+    // WindowsApps Codex is copied out of the package because its installed ACL
+    // blocks direct execution from this smoke. The standalone binary is large
+    // enough that first launch can spend tens of seconds in Windows scanning,
+    // especially immediately after an app update.
+    timeout: 60_000,
   });
   if (result.status !== 0) {
     throw new Error(`Codex ${args.join(" ")} failed: ${result.error?.message || result.stderr || result.signal || `exit ${result.status}`}`);

@@ -18,7 +18,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$DefaultVersion = "0.2.7"
+$DefaultVersion = "0.2.8"
 $DocumentNames = @(
   "LICENSE",
   "NOTICE.md",
@@ -90,8 +90,14 @@ function Assert-Hash {
 function Copy-DirectoryContents {
   param([string]$Source, [string]$Destination)
   New-Item -ItemType Directory -Path $Destination -Force | Out-Null
-  foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($Source)) {
-    Copy-Item -LiteralPath $entry -Destination $Destination -Recurse -Force
+  $robocopy = Join-Path $env:SystemRoot "System32\robocopy.exe"
+  if (-not (Test-Path -LiteralPath $robocopy -PathType Leaf)) {
+    throw "Windows robocopy.exe is required to install the runtime"
+  }
+  & $robocopy $Source $Destination /E /COPY:DAT /DCOPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP
+  $copyExitCode = $LASTEXITCODE
+  if ($copyExitCode -ge 8) {
+    throw "Runtime copy failed with robocopy exit code $copyExitCode"
   }
 }
 

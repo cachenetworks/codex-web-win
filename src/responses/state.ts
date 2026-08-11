@@ -235,9 +235,18 @@ export function rememberResponseState(
       || (details as { reason?: unknown }).reason !== "max_output_tokens") return;
   } else if (response.status !== undefined && response.status !== "completed") return;
   ensureLoaded();
+  const compacted = response.output.some(item => (
+    Boolean(item)
+    && typeof item === "object"
+    && !Array.isArray(item)
+    && (item as { type?: unknown }).type === "compaction"
+  ));
   setEntry(response.id, {
     createdAt: now(),
-    items: [...inputItems(request.input), ...response.output],
+    // Remote compaction replaces the replay epoch. Keeping the full pre-
+    // compaction input here would make our local previous_response_id expansion
+    // silently undo compaction and resend the entire old transcript to ChatGPT.
+    items: compacted ? [...response.output] : [...inputItems(request.input), ...response.output],
   });
   pruneResponses();
   schedulePersist();

@@ -92,17 +92,179 @@ function execGateway(environment: ChatGptTurnEnvironment): CodexTool | undefined
   return tool?.freeform ? tool : undefined;
 }
 
+export interface GatewayNestedTool {
+  wireName: string;
+  description: string;
+  declaration?: string;
+  freeform: boolean;
+}
+
+const GATEWAY_INVENTORY_CACHE_TTL_MS = 1_000;
+
+export function shellCommandInvocationArgs(options: {
+  cmd: string;
+  workdir?: string;
+  yieldTimeMs?: number;
+  timeoutMs?: number;
+  resumable?: boolean;
+}): Record<string, unknown> {
+  // `shell_command.timeout_ms` is a hard runtime deadline, while Codex's
+  // `yield_time_ms` is only a request to hand back a resumable session early.
+  // Treating a 1s yield as a 1s timeout kills perfectly healthy builds/tests.
+  // Preserve the shell tool's normal 10s default for short yields and expose an
+  // explicit timeout for harnesses that do not have a native write_stdin/session
+  // capability.
+  const timeoutMs = options.timeoutMs
+    ?? (options.resumable
+      ? 300_000
+      : options.yieldTimeMs !== undefined ? Math.max(10_000, options.yieldTimeMs) : undefined);
+  return {
+    command: options.cmd,
+    ...(options.workdir ? { workdir: options.workdir } : {}),
+    ...(timeoutMs !== undefined ? { timeout_ms: timeoutMs } : {}),
+  };
+}
+
+function gatewayNestedToolFromSection(wireName: string, section: string): GatewayNestedTool {
+  const declaration = /exec tool declaration:\s*```(?:ts|typescript)?\s*([\s\S]*?)```/i.exec(section)?.[1]?.trim();
+  const description = section.split(/\r?\n\s*exec tool declaration:/i, 1)[0]!.trim();
+  return {
+    wireName,
+    description,
+    ...(declaration ? { declaration } : {}),
+    freeform: /\bFREEFORM\s+tool\b/i.test(section),
+  };
+}
+
+/**
+ * Newer Codex harnesses expose most native/app/MCP tools behind one freeform `exec`
+ * gateway instead of putting every tool in the top-level Responses tool list. The
+ * gateway description is generated from the live registry and contains one
+ * `### `<tool>` section per nested tool, followed by its TypeScript declaration.
+ *
+ * Keep this parser deliberately conservative: only markdown headings shaped exactly
+ * like tool headings are considered. In particular, the prose example near the top
+ * of the gateway currently mentions `tools.exec_command(...)` even on harnesses whose
+ * actual command tool is `shell_command`, so substring matching would select a tool
+ * that does not exist.
+ */
+export function gatewayNestedTools(environment: ChatGptTurnEnvironment): GatewayNestedTool[] {
+  const gateway = execGateway(environment);
+  if (!gateway?.description) return [];
+
+  const source = gateway.description;
+  const heading = /^### `([^`\r\n]+)`\s*$/gm;
+  const matches = [...source.matchAll(heading)];
+  const tools: GatewayNestedTool[] = [];
+
+  for (let index = 0; index < matches.length; index++) {
+    const match = matches[index]!;
+    const wireName = match[1]!.trim();
+    if (!wireName) continue;
+    const start = (match.index ?? 0) + match[0].length;
+    const end = matches[index + 1]?.index ?? source.length;
+    const section = source.slice(start, end).trim();
+    tools.push(gatewayNestedToolFromSection(wireName, section));
+  }
+
+  return tools;
+}
+
+export function parseGatewayRuntimeTools(value: unknown): GatewayNestedTool[] {
+  if (!Array.isArray(value)) return [];
+  const tools: GatewayNestedTool[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const candidate = item as Record<string, unknown>;
+    if (typeof candidate.name !== "string" || !candidate.name.trim()) continue;
+    if (typeof candidate.description !== "string") continue;
+    tools.push(gatewayNestedToolFromSection(candidate.name.trim(), candidate.description));
+  }
+  return tools;
+}
+
+function gatewayNestedTool(environment: ChatGptTurnEnvironment, wireName: string): GatewayNestedTool | undefined {
+  return gatewayNestedTools(environment).find(tool => tool.wireName === wireName);
+}
+
+export function resolveCommandToolName(environment: ChatGptTurnEnvironment): "exec_command" | "shell_command" | undefined {
+  return resolveCommandToolNameFromInventory(environment, gatewayNestedTools(environment));
+}
+
+export function resolveCommandToolNameFromInventory(
+  environment: ChatGptTurnEnvironment,
+  nestedTools: GatewayNestedTool[],
+): "exec_command" | "shell_command" | undefined {
+  if (exactTool(environment, "exec_command")) return "exec_command";
+  if (exactTool(environment, "shell_command")) return "shell_command";
+  if (nestedTools.some(tool => tool.wireName === "exec_command")) return "exec_command";
+  if (nestedTools.some(tool => tool.wireName === "shell_command")) return "shell_command";
+  return undefined;
+}
+
+export function resolveSessionContinuationToolName(
+  environment: ChatGptTurnEnvironment,
+): "write_stdin" | "wait" | undefined {
+  return resolveSessionContinuationToolNameFromInventory(environment, gatewayNestedTools(environment));
+}
+
+export function resolveSessionContinuationToolNameFromInventory(
+  environment: ChatGptTurnEnvironment,
+  nestedTools: GatewayNestedTool[],
+): "write_stdin" | "wait" | undefined {
+  if (exactTool(environment, "write_stdin")) return "write_stdin";
+  if (exactTool(environment, "wait")) return "wait";
+  if (nestedTools.some(tool => tool.wireName === "write_stdin")) return "write_stdin";
+  if (nestedTools.some(tool => tool.wireName === "wait")) return "wait";
+  return undefined;
+}
+
+export function yieldedSessionId(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  for (const item of content) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const block = item as { type?: unknown; text?: unknown };
+    if (block.type !== "text" || typeof block.text !== "string") continue;
+    // Only trust the native exec status line itself. Command output can legitimately
+    // contain this phrase (for example when reading our own tests or docs); an
+    // unanchored match turns that ordinary output into a fake resumable session and
+    // hides the real command result from the web model. Exclude backslashes too so
+    // escaped "\\n" text cannot become part of a synthetic cell id.
+    const match = /^\s*Script running with cell ID\s+([^\s.\\]+)/i.exec(block.text);
+    if (match?.[1]) return match[1];
+  }
+  return undefined;
+}
+
+function withYieldedSessionId<T extends { content?: unknown; structuredContent?: Record<string, unknown> }>(value: T): T {
+  const sessionId = yieldedSessionId(value.content);
+  if (!sessionId) return value;
+  return {
+    ...value,
+    structuredContent: {
+      ...(value.structuredContent ?? {}),
+      session_id: /^\d+$/.test(sessionId) ? Number(sessionId) : sessionId,
+    },
+  };
+}
+
 function gatewayNestedToolName(toolName: string): string {
   return toolName.replace(/[^A-Za-z0-9_$]/g, "_");
 }
 
-function execGatewayProgram(
+export function execGatewayProgram(
   nestedToolName: string,
   freeform: boolean,
   payload: { arguments?: Record<string, unknown>; input?: string },
+  options: { yieldTimeMs?: number; maxOutputTokens?: number } = {},
 ): string {
   const nestedInput = freeform ? payload.input ?? "" : payload.arguments ?? {};
+  const execOptions = {
+    ...(options.yieldTimeMs !== undefined ? { yield_time_ms: options.yieldTimeMs } : {}),
+    ...(options.maxOutputTokens !== undefined ? { max_output_tokens: options.maxOutputTokens } : {}),
+  };
   return [
+    ...(Object.keys(execOptions).length > 0 ? [`// @exec: ${JSON.stringify(execOptions)}`] : []),
     `const result = await tools[${JSON.stringify(gatewayNestedToolName(nestedToolName))}](${JSON.stringify(nestedInput)});`,
     "const emit = value => {",
     "  if (Array.isArray(value)) { for (const item of value) emit(item); return; }",
@@ -121,8 +283,27 @@ function execGatewayProgram(
   ].join("\n");
 }
 
+export function waitCellInvocationArgs(options: {
+  sessionId: string | number;
+  yieldTimeMs?: number;
+  maxOutputTokens?: number;
+  terminate?: boolean;
+}): Record<string, unknown> {
+  return {
+    cell_id: String(options.sessionId),
+    ...(options.yieldTimeMs !== undefined ? { yield_time_ms: options.yieldTimeMs } : {}),
+    ...(options.maxOutputTokens !== undefined ? { max_tokens: options.maxOutputTokens } : {}),
+    ...(options.terminate !== undefined ? { terminate: options.terminate } : {}),
+  };
+}
+
 export async function runChatGptMcpServer(options: { brokerSocketPath: string }): Promise<void> {
-  const server = new McpServer({ name: "codex-native", version: "3.0.0" });
+  const server = new McpServer({ name: "codex-native", version: "4.0.0" });
+  const gatewayInventoryCache = new Map<string, {
+    fingerprint: string;
+    createdAt: number;
+    tools: Promise<GatewayNestedTool[]>;
+  }>();
 
   const environment = async (bindingId: string): Promise<ChatGptTurnEnvironment & { expiresAt: number }> => {
     const resolved = await callTurnBroker<ResolvedTurn>(options.brokerSocketPath, { method: "resolve", bindingId });
@@ -130,20 +311,76 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     return resolved.environment;
   };
 
-  const invoke = async (
+  const invokeRaw = async (
     bindingId: string,
     bound: ChatGptTurnEnvironment & { expiresAt: number },
     tool: CodexTool,
     payload: { arguments?: Record<string, unknown>; input?: string },
-  ) => {
-    const response = await callTurnBroker<BrokerToolResult>(options.brokerSocketPath, {
+  ): Promise<BrokerToolResult> => callTurnBroker<BrokerToolResult>(options.brokerSocketPath, {
       method: "invoke",
       bindingId,
       wireName: wireName(tool),
       freeform: tool.freeform === true,
       ...(tool.freeform ? { input: payload.input ?? "" } : { arguments: payload.arguments ?? {} }),
     }, invocationTimeout(bound));
-    return asMcpResult(response);
+
+  const invoke = async (
+    bindingId: string,
+    bound: ChatGptTurnEnvironment & { expiresAt: number },
+    tool: CodexTool,
+    payload: { arguments?: Record<string, unknown>; input?: string },
+  ) => asMcpResult(await invokeRaw(bindingId, bound, tool, payload));
+
+  const discoverGatewayTools = (
+    bindingId: string,
+    bound: ChatGptTurnEnvironment & { expiresAt: number },
+  ): Promise<GatewayNestedTool[]> => {
+    const fingerprint = createHash("sha256").update(JSON.stringify(bound.tools.map(tool => ({
+      wireName: wireName(tool),
+      description: tool.description,
+      parameters: tool.parameters,
+      freeform: tool.freeform === true,
+      toolSearch: tool.toolSearch === true,
+    })))).digest("hex");
+    const cached = gatewayInventoryCache.get(bindingId);
+    if (cached
+      && cached.fingerprint === fingerprint
+      && Date.now() - cached.createdAt < GATEWAY_INVENTORY_CACHE_TTL_MS) return cached.tools;
+    const pending = (async () => {
+      const fallback = gatewayNestedTools(bound);
+      const gateway = execGateway(bound);
+      if (!gateway) return fallback;
+      try {
+        const response = await invokeRaw(bindingId, bound, gateway, {
+          input: "text(ALL_TOOLS.map(tool => ({ name: tool.name, description: tool.description })));",
+        });
+        const textBlock = response.content.find((item): item is { type: string; text: string } => (
+          Boolean(item) && typeof item === "object" && !Array.isArray(item)
+          && (item as Record<string, unknown>).type === "text"
+          && typeof (item as Record<string, unknown>).text === "string"
+        ));
+        if (!textBlock) return fallback;
+        const runtime = parseGatewayRuntimeTools(JSON.parse(textBlock.text));
+        if (runtime.length === 0) return fallback;
+        const merged = new Map(fallback.map(tool => [tool.wireName, tool]));
+        for (const tool of runtime) {
+          const existing = merged.get(tool.wireName);
+          merged.set(tool.wireName, existing
+            ? {
+                ...tool,
+                description: tool.description || existing.description,
+                declaration: tool.declaration ?? existing.declaration,
+                freeform: tool.freeform || existing.freeform,
+              }
+            : tool);
+        }
+        return [...merged.values()];
+      } catch {
+        return fallback;
+      }
+    })();
+    gatewayInventoryCache.set(bindingId, { fingerprint, createdAt: Date.now(), tools: pending });
+    return pending;
   };
 
   const invokeNative = (
@@ -151,12 +388,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     bound: ChatGptTurnEnvironment & { expiresAt: number },
     tool: CodexTool,
     payload: { arguments?: Record<string, unknown>; input?: string },
-  ) => {
-    const gateway = execGateway(bound);
-    return gateway && gateway !== tool
-      ? invoke(bindingId, bound, gateway, { input: execGatewayProgram(wireName(tool), tool.freeform === true, payload) })
-      : invoke(bindingId, bound, tool, payload);
-  };
+  ) => invoke(bindingId, bound, tool, payload);
 
   const invokeNestedNative = (
     bindingId: string,
@@ -164,13 +396,14 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     nestedToolName: string,
     freeform: boolean,
     payload: { arguments?: Record<string, unknown>; input?: string },
+    options: { yieldTimeMs?: number; maxOutputTokens?: number } = {},
   ) => {
     const gateway = execGateway(bound);
     if (!gateway) {
       throw new Error(`This Codex turn did not advertise ${nestedToolName} or the native exec gateway`);
     }
     return invoke(bindingId, bound, gateway, {
-      input: execGatewayProgram(nestedToolName, freeform, payload),
+      input: execGatewayProgram(nestedToolName, freeform, payload, options),
     });
   };
 
@@ -187,19 +420,40 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       const claimed = await callTurnBroker<ClaimedTurn>(options.brokerSocketPath, { method: "claim", token: turn_token });
       const commandTool = exactTool(claimed.environment, "exec_command") ?? exactTool(claimed.environment, "shell_command");
       const gateway = execGateway(claimed.environment);
+      // The exec description may intentionally omit deferred tools. Bind is the
+      // capability handshake ChatGPT relies on before its first native action,
+      // so report the same live ALL_TOOLS surface that codex_tool_inventory uses
+      // instead of under-counting whatever happened to fit in gateway prose.
+      const discovered = gateway ? await discoverGatewayTools(claimed.bindingId, claimed.environment) : [];
+      const commandToolName = resolveCommandToolNameFromInventory(claimed.environment, discovered);
+      const hasNativeTool = (name: string) => Boolean(
+        exactTool(claimed.environment, name) ?? discovered.find(tool => tool.wireName === name),
+      );
+      const directToolNames = new Set(claimed.environment.tools.map(tool => wireName(tool)));
+      const nestedToolNames = new Set(discovered
+        .map(tool => tool.wireName)
+        .filter(name => !directToolNames.has(name)));
+      const capabilities = ["native_tool_loop", "tool_registry"];
+      if (commandToolName) capabilities.push("exec");
+      if (hasNativeTool("write_stdin") || hasNativeTool("wait")) capabilities.push("session_history");
+      if (hasNativeTool("wait")) capabilities.push("session_termination");
+      if (hasNativeTool("apply_patch")) capabilities.push("apply_patch");
+      if (hasNativeTool("view_image")) capabilities.push("images");
       return result({
         binding_id: claimed.bindingId,
-        harness_version: 3,
+        harness_version: 4,
         execution: "outer_codex_native",
         cwd: claimed.environment.cwd,
         roots: claimed.environment.roots,
         writable_roots: claimed.environment.writableRoots,
         sandbox: claimed.environment.sandboxPolicy.type,
         expires_at: new Date(claimed.environment.expiresAt).toISOString(),
-        tool_count: claimed.environment.tools.length,
-        command_tool: commandTool ? wireName(commandTool) : gateway ? "exec_command" : null,
+        tool_count: directToolNames.size + nestedToolNames.size,
+        direct_tool_count: directToolNames.size,
+        nested_tool_count: nestedToolNames.size,
+        command_tool: commandTool ? wireName(commandTool) : commandToolName ?? null,
         outer_tool_gateway: gateway ? wireName(gateway) : null,
-        capabilities: ["native_tool_loop", "session_history", "exec", "apply_patch", "images", "tool_registry"],
+        capabilities,
       authorization: {
         sandbox: claimed.environment.sandboxPolicy.type,
         local_mutations_preapproved: claimed.environment.sandboxPolicy.type === "dangerFullAccess",
@@ -216,22 +470,26 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     "codex_exec",
     {
       title: "Run a native Codex command",
-      description: "Invoke the command tool advertised by the current outer Codex harness. Permission is governed by the trusted bound Codex environment; dangerFullAccess pre-authorizes ordinary task-required local development commands and mutations, while real native runtime refusals/approvals remain authoritative. A long-running command returns its native session_id.",
+      description: "Invoke the command tool advertised by the current outer Codex harness. Permission is governed by the trusted bound Codex environment; dangerFullAccess pre-authorizes ordinary task-required local development commands and mutations, while real native runtime refusals/approvals remain authoritative. A long-running command returns its native session_id when the outer harness supports resumable sessions; otherwise use timeout_ms for a blocking command.",
       inputSchema: {
         binding_id: bindingSchema,
         cmd: z.string().min(1).max(100_000),
         workdir: z.string().max(16_384).optional(),
         yield_time_ms: z.number().int().min(250).max(30_000).optional(),
+        timeout_ms: z.number().int().min(1_000).max(300_000).optional(),
         max_output_tokens: z.number().int().min(1).max(1_000_000).optional(),
         tty: z.boolean().optional(),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ binding_id, cmd, workdir, yield_time_ms, max_output_tokens, tty }, extra) => {
+    async ({ binding_id, cmd, workdir, yield_time_ms, timeout_ms, max_output_tokens, tty }, extra) => {
       console.error(`[chatgpt-web-mcp] codex_exec scope=${requestScopeSummary(extra)}`);
       const bound = await environment(binding_id);
       const tool = exactTool(bound, "exec_command") ?? exactTool(bound, "shell_command");
-      const commandName = tool?.name ?? "exec_command";
+      const discovered = tool ? [] : await discoverGatewayTools(binding_id, bound);
+      const commandName = tool?.name ?? resolveCommandToolNameFromInventory(bound, discovered);
+      if (!commandName) throw new Error("This Codex turn did not advertise exec_command, shell_command, or a compatible native exec gateway");
+      const nestedResumable = !tool && resolveSessionContinuationToolNameFromInventory(bound, discovered) !== undefined;
       const args = commandName === "exec_command"
         ? {
             cmd,
@@ -240,14 +498,20 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
             ...(max_output_tokens !== undefined ? { max_output_tokens } : {}),
             ...(tty !== undefined ? { tty } : {}),
           }
-        : {
-            command: cmd,
+        : shellCommandInvocationArgs({
+            cmd,
             ...(workdir ? { workdir } : {}),
-            ...(yield_time_ms !== undefined ? { timeout_ms: yield_time_ms } : {}),
-          };
-      return tool
+            ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
+            ...(timeout_ms !== undefined ? { timeoutMs: timeout_ms } : {}),
+            ...(nestedResumable ? { resumable: true } : {}),
+          });
+      const response = tool
         ? invokeNative(binding_id, bound, tool, { arguments: args })
-        : invokeNestedNative(binding_id, bound, commandName, false, { arguments: args });
+        : invokeNestedNative(binding_id, bound, commandName, false, { arguments: args }, {
+            ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
+            ...(max_output_tokens !== undefined ? { maxOutputTokens: max_output_tokens } : {}),
+          });
+      return withYieldedSessionId(await response);
     },
   );
 
@@ -255,19 +519,49 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     "codex_write_stdin",
     {
       title: "Continue a native Codex command session",
-      description: "Write characters to, or poll, a session_id returned by codex_exec.",
+      description: "Write characters to, poll, or terminate a session_id returned by codex_exec or codex_tool_call. Harnesses exposing a wait/cell primitive support polling/termination but not stdin writes.",
       inputSchema: {
         binding_id: bindingSchema,
-        session_id: z.number().int().nonnegative(),
+        session_id: z.union([z.number().int().nonnegative(), z.string().min(1).max(256)]),
         chars: z.string().max(1_000_000).optional(),
         yield_time_ms: z.number().int().min(250).max(300_000).optional(),
         max_output_tokens: z.number().int().min(1).max(1_000_000).optional(),
+        terminate: z.boolean().optional(),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ binding_id, session_id, chars, yield_time_ms, max_output_tokens }) => {
+    async ({ binding_id, session_id, chars, yield_time_ms, max_output_tokens, terminate }) => {
       const bound = await environment(binding_id);
       const tool = exactTool(bound, "write_stdin");
+      const directWait = tool ? undefined : exactTool(bound, "wait");
+      const discovered = tool || directWait ? [] : await discoverGatewayTools(binding_id, bound);
+      const nestedWrite = discovered.find(candidate => candidate.wireName === "write_stdin");
+      const nestedWait = nestedWrite ? undefined : discovered.find(candidate => candidate.wireName === "wait");
+      if (!tool && !directWait && !nestedWrite && !nestedWait) {
+        throw new Error(
+          "This Codex harness has no resumable write_stdin or wait/cell capability. Run the command with codex_exec timeout_ms instead, and call codex_write_stdin only when codex_exec actually returned a session_id.",
+        );
+      }
+
+      const waitMode = Boolean(directWait || nestedWait);
+      if (waitMode && chars !== undefined && chars.length > 0) {
+        throw new Error("This Codex harness exposes polling-only wait cells; it cannot write stdin to the yielded command");
+      }
+      if (waitMode) {
+        const waitPayload = { arguments: waitCellInvocationArgs({
+          sessionId: session_id,
+          ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
+          ...(max_output_tokens !== undefined ? { maxOutputTokens: max_output_tokens } : {}),
+          ...(terminate !== undefined ? { terminate } : {}),
+        }) };
+        const response = directWait
+          ? invokeNative(binding_id, bound, directWait, waitPayload)
+          : invokeNestedNative(binding_id, bound, "wait", false, waitPayload);
+        return withYieldedSessionId(await response);
+      }
+      if (terminate) {
+        throw new Error("This Codex harness exposes write_stdin but not a wait/cell termination primitive");
+      }
       const payload = { arguments: {
         session_id,
         ...(chars !== undefined ? { chars } : {}),
@@ -336,14 +630,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     },
     async ({ binding_id, query, offset, limit, include_schema }) => {
       const bound = await environment(binding_id);
-      const needle = query?.trim().toLowerCase();
-      const matches = bound.tools.filter(tool => !needle || [
-        wireName(tool),
-        tool.name,
-        tool.namespace ?? "",
-        tool.description,
-      ].join("\n").toLowerCase().includes(needle));
-      const page = matches.slice(offset, offset + limit).map(tool => ({
+      const direct = bound.tools.map(tool => ({
         wire_name: wireName(tool),
         name: tool.name,
         namespace: tool.namespace ?? null,
@@ -351,6 +638,29 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
         kind: tool.freeform ? "freeform" : tool.toolSearch ? "tool_search" : "function",
         ...(include_schema ? { parameters: tool.parameters } : {}),
       }));
+      const directNames = new Set(direct.map(tool => tool.wire_name));
+      const nested = (await discoverGatewayTools(binding_id, bound))
+        .filter(tool => !directNames.has(tool.wireName))
+        .map(tool => ({
+          wire_name: tool.wireName,
+          name: tool.wireName,
+          namespace: null,
+          description: tool.description,
+          kind: tool.freeform ? "freeform" : "function",
+          ...(include_schema && tool.freeform
+            ? { parameters: { type: "object", properties: { input: { type: "string" } }, required: ["input"] } }
+            : {}),
+          ...(include_schema && tool.declaration ? { declaration: tool.declaration } : {}),
+        }));
+      const needle = query?.trim().toLowerCase();
+      const matches = [...direct, ...nested].filter(tool => !needle || [
+        tool.wire_name,
+        tool.name,
+        tool.namespace ?? "",
+        tool.description,
+        "declaration" in tool ? tool.declaration ?? "" : "",
+      ].join("\n").toLowerCase().includes(needle));
+      const page = matches.slice(offset, offset + limit);
       return result({
         tools: page,
         total: matches.length,
@@ -369,19 +679,38 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
         wire_name: z.string().min(1).max(1_000),
         arguments: jsonArgumentsSchema.optional(),
         input: z.string().max(5_000_000).optional(),
+        yield_time_ms: z.number().int().min(250).max(300_000).optional(),
+        max_output_tokens: z.number().int().min(1).max(1_000_000).optional(),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    async ({ binding_id, wire_name, arguments: args, input }) => {
+    async ({ binding_id, wire_name, arguments: args, input, yield_time_ms, max_output_tokens }) => {
       const bound = await environment(binding_id);
-      const tool = namedTool(bound, wire_name);
-      if (tool.freeform) {
+      const tool = bound.tools.find(candidate => wireName(candidate) === wire_name);
+      const nested = tool
+        ? undefined
+        : (await discoverGatewayTools(binding_id, bound)).find(candidate => candidate.wireName === wire_name);
+      if (!tool && !nested) throw new Error(`Codex tool is not available in this turn: ${wire_name}`);
+      const freeform = tool?.freeform === true || nested?.freeform === true;
+      if (freeform) {
         if (input === undefined) throw new Error(`Freeform Codex tool ${wire_name} requires input`);
         if (args && Object.keys(args).length > 0) throw new Error(`Freeform Codex tool ${wire_name} does not accept arguments`);
-        return invokeNative(binding_id, bound, tool, { input });
+        const response = tool
+          ? invokeNative(binding_id, bound, tool, { input })
+          : invokeNestedNative(binding_id, bound, wire_name, true, { input }, {
+              ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
+              ...(max_output_tokens !== undefined ? { maxOutputTokens: max_output_tokens } : {}),
+            });
+        return withYieldedSessionId(await response);
       }
       if (input !== undefined) throw new Error(`Function Codex tool ${wire_name} does not accept freeform input`);
-      return invokeNative(binding_id, bound, tool, { arguments: args ?? {} });
+      const response = tool
+        ? invokeNative(binding_id, bound, tool, { arguments: args ?? {} })
+        : invokeNestedNative(binding_id, bound, wire_name, false, { arguments: args ?? {} }, {
+            ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
+            ...(max_output_tokens !== undefined ? { maxOutputTokens: max_output_tokens } : {}),
+          });
+      return withYieldedSessionId(await response);
     },
   );
 

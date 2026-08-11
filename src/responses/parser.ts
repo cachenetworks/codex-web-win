@@ -266,7 +266,10 @@ export function parseRequest(body: unknown): CodexParsedRequest {
       const effectiveType = (item as { type?: string }).type ?? ("role" in item ? "message" : undefined);
 
       if (effectiveType === "compaction_trigger") {
-        compactionRequest = true;
+        // A trigger restored from previous_response_id is historical input and
+        // must not launch another compaction turn. Only the newly appended
+        // suffix may request compaction.
+        if (inputIndex >= replayedInputPrefixLength) compactionRequest = true;
         continue;
       }
 

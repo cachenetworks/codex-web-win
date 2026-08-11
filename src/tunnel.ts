@@ -7,7 +7,7 @@ import { atomicWriteFile, getConfigDir } from "./config";
 import { runCommand, runChecked } from "./process";
 import { getTunnelServiceStatus } from "./tunnel-service";
 
-const TUNNEL_VERSION = "0.0.10";
+const TUNNEL_VERSION = "0.0.11";
 const RELEASE_BASE = `https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_VERSION}`;
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 
@@ -64,10 +64,13 @@ export async function installTunnelClient(): Promise<string> {
   if (existsSync(executable) && existsSync(manifestFile)) {
     const manifest = JSON.parse(readFileSync(manifestFile, "utf8")) as Partial<TunnelInstallManifest>;
     const actual = sha256(readFileSync(executable));
-    if (manifest.version === 1 && manifest.tunnelClientVersion === TUNNEL_VERSION && manifest.binarySha256 === actual) {
-      return executable;
+    if (manifest.version === 1 && manifest.tunnelClientVersion === TUNNEL_VERSION) {
+      if (manifest.binarySha256 === actual) return executable;
+      throw new Error(`Existing tunnel-client failed integrity validation: ${executable}`);
     }
-    throw new Error(`Existing tunnel-client failed integrity validation: ${executable}`);
+    // A pinned version change is an ordinary managed upgrade. The replacement
+    // archive and extracted binary are both verified below before the existing
+    // executable or manifest is atomically replaced.
   }
 
   const asset = platformAsset();
@@ -365,4 +368,11 @@ export async function waitForTunnelReady(config: AppConfig, timeoutMs = 30_000):
 
 export function tunnelClientVersion(): string {
   return TUNNEL_VERSION;
+}
+
+export function installedTunnelClientVersion(path: string): string | undefined {
+  if (!existsSync(path)) return undefined;
+  const result = runCommand(path, ["--version"]);
+  if (result.status !== 0) return undefined;
+  return /\b(\d+\.\d+\.\d+)\b/.exec(`${result.stdout}\n${result.stderr}`)?.[1];
 }

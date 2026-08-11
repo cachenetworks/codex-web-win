@@ -58,12 +58,10 @@ export function buildChatGptWebModel(
     service_tiers: [],
     default_service_tier: null,
   };
-  // The browser product owns its context and performs its own internal compaction. Advertising the
-  // native template's context boundary makes Codex launch a second remote-compaction turn, which
-  // cannot preserve the in-flight ChatGPT browser/MCP response.
-  delete model.context_window;
-  delete model.max_context_window;
-  delete model.auto_compact_token_limit;
+  // Preserve the native template's context/auto-compaction boundary. The local
+  // route now handles Codex remote compaction itself and stores only the compacted
+  // replay epoch, so letting Codex trigger compaction materially reduces the
+  // context repeatedly transported through ChatGPT Web.
   delete model.comp_hash;
   delete model.availability_nux;
   return model;
@@ -82,9 +80,13 @@ export function augmentNativeModelCatalog(
   if (!template) {
     throw new Error(`Native Codex models response is missing ${NATIVE_TEMPLATE_MODEL}`);
   }
-  const nativeModels = structuredClone(
-    catalog.models.filter(model => !slug(model)?.startsWith(CHATGPT_WEB_MODEL_PREFIX)),
-  );
+  // Browser-only mode must fail closed around native Codex usage. Keep the native
+  // catalog only as a metadata template for the synthetic ChatGPT Web entries;
+  // advertising native models here lets Codex select one and silently bypass the
+  // browser route. Full mode intentionally preserves native passthrough.
+  const nativeModels = config.mode === "full"
+    ? structuredClone(catalog.models.filter(model => !slug(model)?.startsWith(CHATGPT_WEB_MODEL_PREFIX)))
+    : [];
   if (contextOverride) {
     const selected = nativeModels.find(model => slug(model) === contextOverride.model);
     if (selected) {

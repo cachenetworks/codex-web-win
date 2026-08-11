@@ -137,6 +137,10 @@ function emitReadOnlyContextWarning(
   capabilities: ChatGptWebCapabilities,
   emit: (event: AdapterEvent) => void,
 ): void {
+  // Compaction is an internal summarizer exchange. Emitting the normal
+  // browser-only warning here would be accumulated into the synthetic compacted
+  // summary and pollute every later replay.
+  if (parsed._compactionRequest) return;
   const warning = chatGptReadOnlyContextWarning(parsed, capabilities);
   if (!warning) return;
   emit({ type: "assistant_boundary" });

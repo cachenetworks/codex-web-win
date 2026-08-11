@@ -131,8 +131,21 @@ export type ChatGptTurnRuntime =
 
 export function chatGptTurnExecutionKey(parsed: CodexParsedRequest): string {
   const identity = extractChatGptTurnIdentity(parsed);
-  if (!identity.turnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser-session replay");
-  const payload = { threadId: identity.threadId, turnId: identity.turnId };
+  if (!identity.turnId && !parsed._compactionRequest) {
+    throw new Error("ChatGPT web requires native Codex turn_id metadata for browser-session replay");
+  }
+  // Compaction is an independent summarizer exchange. Some Codex compact
+  // transports omit turn_id, and a v2 compaction subrequest may reuse the parent
+  // turn id. Give it a distinct deterministic key so it never reattaches to an
+  // in-flight browser/tool session for the real task turn.
+  const payload = parsed._compactionRequest
+    ? {
+        compaction: true,
+        threadId: identity.threadId,
+        turnId: identity.turnId,
+        requestHash: createHash("sha256").update(JSON.stringify(parsed._rawBody ?? {})).digest("hex"),
+      }
+    : { threadId: identity.threadId, turnId: identity.turnId };
   return createHash("sha256").update(JSON.stringify({
     modelId: parsed.modelId,
     reasoning: parsed.options.reasoning,

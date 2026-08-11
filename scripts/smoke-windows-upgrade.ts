@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { tunnelClientVersion } from "../src/tunnel";
 
 interface CommandResult {
   exitCode: number;
@@ -266,7 +267,7 @@ async function seedAttestedTunnelClient(
   const binarySha256 = createHash("sha256").update(bytes).digest("hex");
   writeFileSync(manifestPath, `${JSON.stringify({
     version: 1,
-    tunnelClientVersion: "0.0.10",
+    tunnelClientVersion: tunnelClientVersion(),
     asset: "offline-upgrade-smoke-fixture.zip",
     archiveSha256: binarySha256,
     binarySha256,

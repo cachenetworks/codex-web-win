@@ -4,7 +4,7 @@ import { getConfigPath, loadConfig } from "./config";
 import { inspectCodexIntegration } from "./codex-integration";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
 import { getServiceStatus } from "./service";
-import { tunnelStatus } from "./tunnel";
+import { installedTunnelClientVersion, tunnelClientVersion, tunnelStatus } from "./tunnel";
 import { getTunnelServiceStatus } from "./tunnel-service";
 
 export type CheckStatus = "ok" | "warning" | "error";
@@ -108,7 +108,16 @@ export async function runDoctor(): Promise<DoctorReport> {
     if (!existsSync(settings.binaryPath)) {
       checks.push({ id: "tunnel-binary", status: "error", message: `tunnel-client is missing: ${settings.binaryPath}` });
     } else {
-      checks.push({ id: "tunnel-binary", status: "ok", message: "Pinned openai/tunnel-client binary is installed" });
+      const installedVersion = installedTunnelClientVersion(settings.binaryPath);
+      const requiredVersion = tunnelClientVersion();
+      checks.push(installedVersion === requiredVersion
+        ? { id: "tunnel-binary", status: "ok", message: `Pinned openai/tunnel-client ${requiredVersion} is installed` }
+        : {
+            id: "tunnel-binary",
+            status: "error",
+            message: `tunnel-client version mismatch; expected ${requiredVersion}, found ${installedVersion ?? "unknown"}`,
+            detail: "Rerun setup to install the pinned tunnel client before starting Full mode.",
+          });
     }
     if (!existsSync(settings.runtimeKeyFile)) {
       checks.push({ id: "tunnel-key", status: "error", message: "Tunnel runtime key file is missing" });

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "..");
@@ -18,12 +18,23 @@ const expected = [
   [".github/workflows/ci.yml", "$expectedVersion = [string]$manifest.appVersion"],
   [".github/workflows/release.yml", "$expectedVersion = [string]$manifest.appVersion"],
 ] as const;
+const repositoryOnlyPaths = new Set([
+  ".github/workflows/ci.yml",
+  ".github/workflows/release.yml",
+]);
 for (const [path, needle] of expected) {
-  if (!readFileSync(resolve(root, path), "utf8").includes(needle)) throw new Error(`${path} is not synchronized to ${packageVersion}`);
+  const absolutePath = resolve(root, path);
+  if (!existsSync(absolutePath)) {
+    if (repositoryOnlyPaths.has(path)) continue;
+    throw new Error(`Required versioned file is missing: ${path}`);
+  }
+  if (!readFileSync(absolutePath, "utf8").includes(needle)) throw new Error(`${path} is not synchronized to ${packageVersion}`);
 }
 const hardCodedWorkflowVersion = /(?:\$version(?:Text)?(?:\.Trim\(\))?|\$about\.version)\s+-ne\s+["']\d+\.\d+\.\d+(?:-[^"']+)?["']/;
 for (const path of [".github/workflows/ci.yml", ".github/workflows/release.yml"]) {
-  if (hardCodedWorkflowVersion.test(readFileSync(resolve(root, path), "utf8"))) {
+  const absolutePath = resolve(root, path);
+  if (!existsSync(absolutePath)) continue;
+  if (hardCodedWorkflowVersion.test(readFileSync(absolutePath, "utf8"))) {
     throw new Error(`${path} hard-codes a Windows artifact version instead of reading dist/runtime/manifest.json`);
   }
 }

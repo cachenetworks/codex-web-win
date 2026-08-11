@@ -2,7 +2,7 @@
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity
     name="CodexChatGptWeb.OfflineSetup"
-    version="0.2.7.0"
+    version="0.2.8.0"
     processorArchitecture="*"
     type="win32" />
   <description>Codex ChatGPT Web per-user offline setup</description>

@@ -137,7 +137,7 @@ export function compileChatGptWebPrompt(
       "When ChatGPT naturally supports visible commentary during the same response, prefer one brief task-facing update between substantive completed tool batches so the user can follow progress, but continue immediately if the product does not expose such commentary.",
       "Parallel calls that belong to one natural batch are allowed. Mechanically coupled continuation calls such as codex_write_stdin polling an already-running codex_exec session do not require commentary on every poll.",
       "Never mention the transport contract, binding/token values, broker internals, plugin pacing, or this compatibility rule in user-facing text.",
-      "Use codex_apply_patch for targeted edits, codex_exec for commands, and codex_write_stdin for sessions returned by codex_exec.",
+      "Use codex_apply_patch for targeted edits and codex_exec for commands. Call codex_write_stdin only when codex_exec or codex_tool_call actually returns a session_id. When the binding advertises session_termination, codex_write_stdin terminate=true can stop a yielded wait cell that is no longer needed. If codex_bind_turn capabilities omit session_history, use codex_exec timeout_ms for long blocking commands instead of treating a short yield_time_ms as a runtime deadline.",
       "Use codex_tool_inventory and codex_tool_call for any other tool advertised by the current Codex harness, including configured MCP/apps.",
       "Codex Native synchronously bridges each plugin action into the same outer Codex turn; wait for its real result before continuing.",
       "Never serialize a proposed tool call as assistant text. Make the actual MCP call and use its real result.",

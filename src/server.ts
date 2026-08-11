@@ -23,6 +23,7 @@ import {
 } from "./chatgpt-web-models";
 import { forwardNativeCodexRequest, type NativeFetch } from "./native-passthrough";
 import { parseRequest } from "./responses/parser";
+import { buildCompactV1Output, COMPACT_PROMPT, extractCompactUserMessages } from "./responses/compaction";
 import { expandPreviousResponseInput, flushResponseState, rememberResponseState } from "./responses/state";
 import { normalizeCodexTurnMetadata } from "./responses/turn-metadata";
 import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "./types";
@@ -148,6 +149,46 @@ function toolBridgeMaps(parsed: CodexParsedRequest): {
   return { toolNsMap, freeformToolNames, toolSearchToolNames };
 }
 
+function compactionProviderConfig(config: AppConfig) {
+  const provider = providerConfig(config);
+  return {
+    ...provider,
+    chatgptWeb: provider.chatgptWeb
+      ? { ...provider.chatgptWeb, localToolsEnabled: false }
+      : provider.chatgptWeb,
+  };
+}
+
+function prepareCompactionTurn(parsed: CodexParsedRequest): void {
+  parsed._compactionRequest = true;
+  parsed.context.systemPrompt = [...(parsed.context.systemPrompt ?? []), COMPACT_PROMPT];
+  parsed.context.tools = undefined;
+}
+
+function compactSummaryFromResponse(response: Record<string, unknown>): string {
+  if (response.status !== "completed") {
+    throw new Error(`ChatGPT compaction ended with status ${String(response.status)}`);
+  }
+  const output = Array.isArray(response.output) ? response.output : [];
+  const texts: Array<{ phase?: unknown; text: string }> = [];
+  for (const item of output) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const message = item as { type?: unknown; phase?: unknown; content?: unknown };
+    if (message.type !== "message" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (!part || typeof part !== "object" || Array.isArray(part)) continue;
+      const block = part as { type?: unknown; text?: unknown };
+      if (block.type === "output_text" && typeof block.text === "string") {
+        texts.push({ phase: message.phase, text: block.text });
+      }
+    }
+  }
+  const final = texts.filter(item => item.phase === "final_answer").map(item => item.text).join("").trim();
+  const summary = final || texts.map(item => item.text).join("").trim();
+  if (!summary) throw new Error("ChatGPT compaction completed without a summary");
+  return summary;
+}
+
 export async function responseRequest(req: Request, config: AppConfig): Promise<Response> {
   const nativeRequest = req.clone();
   let raw: unknown;
@@ -164,6 +205,13 @@ export async function responseRequest(req: Request, config: AppConfig): Promise<
     ? (raw as { model?: unknown }).model
     : undefined;
   if (typeof requestedModel === "string" && !isChatGptWebModelSlug(requestedModel)) {
+    if (config.mode === "browser-only") {
+      return formatErrorResponse(
+        400,
+        "invalid_request_error",
+        `Native Codex passthrough is disabled in browser-only mode: ${requestedModel}`,
+      );
+    }
     try {
       return await forwardNativeCodexRequest(nativeRequest, "responses");
     } catch (error) {
@@ -186,15 +234,11 @@ export async function responseRequest(req: Request, config: AppConfig): Promise<
     return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
   }
 
-  if (parsed._compactionRequest === true) {
-    return formatErrorResponse(
-      400,
-      "invalid_request_error",
-      "Codex remote compaction is disabled for ChatGPT Web; ChatGPT owns context compaction inside the browser response",
-    );
-  }
+  if (parsed._compactionRequest === true) prepareCompactionTurn(parsed);
 
-  const adapter = createChatGptWebAdapter(providerConfig(config));
+  const adapter = createChatGptWebAdapter(
+    parsed._compactionRequest === true ? compactionProviderConfig(config) : providerConfig(config),
+  );
   try {
     await adapter.validateTurn?.(parsed, { headers: req.headers, abortSignal: req.signal });
   } catch (error) {
@@ -237,6 +281,7 @@ export async function responseRequest(req: Request, config: AppConfig): Promise<
       2_000,
       {
         hideThinkingSummary: parsed.options.hideThinkingSummary,
+        compaction: parsed._compactionRequest === true,
         onCompletedResponse: response => rememberResponseState(parsed._rawBody, response, { force: true }),
       },
     );
@@ -257,12 +302,13 @@ export async function responseRequest(req: Request, config: AppConfig): Promise<
     toolNsMap: maps.toolNsMap,
     freeformToolNames: maps.freeformToolNames,
     toolSearchToolNames: maps.toolSearchToolNames,
+    compaction: parsed._compactionRequest === true,
   });
   rememberResponseState(parsed._rawBody, json, { force: true });
   return Response.json(json);
 }
 
-export async function compactRequest(req: Request, _config: AppConfig): Promise<Response> {
+export async function compactRequest(req: Request, config: AppConfig): Promise<Response> {
   const nativeRequest = req.clone();
   let raw: Record<string, unknown>;
   try {
@@ -280,22 +326,50 @@ export async function compactRequest(req: Request, _config: AppConfig): Promise<
     return formatErrorResponse(400, "invalid_request_error", "Compaction request requires a model");
   }
   if (!isChatGptWebModelSlug(raw.model)) {
+    if (config.mode === "browser-only") {
+      return formatErrorResponse(
+        400,
+        "invalid_request_error",
+        `Native Codex passthrough is disabled in browser-only mode: ${raw.model}`,
+      );
+    }
     try {
       return await forwardNativeCodexRequest(nativeRequest, "responses/compact");
     } catch (error) {
       return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
     }
   }
+
+  let parsed: CodexParsedRequest;
+  let route: ChatGptWebModelRoute;
   try {
-    requireChatGptWebModelRoute(raw.model, _config.proAvailable);
+    const normalized = normalizeCodexTurnMetadata({
+      ...raw,
+      stream: false,
+      tools: [],
+      tool_choice: "none",
+    }, req.headers);
+    parsed = parseRequest(expandPreviousResponseInput(normalized));
+    route = routeChatGptWebRequest(parsed, config);
+    prepareCompactionTurn(parsed);
   } catch (error) {
     return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
   }
-  return formatErrorResponse(
-    400,
-    "invalid_request_error",
-    "Codex remote compaction is disabled for ChatGPT Web; ChatGPT owns context compaction inside the browser response",
-  );
+
+  const adapter = createChatGptWebAdapter(compactionProviderConfig(config));
+  try {
+    await adapter.validateTurn?.(parsed, { headers: req.headers, abortSignal: req.signal });
+    const events: AdapterEvent[] = [];
+    await adapter.runTurn!(parsed, { headers: req.headers, abortSignal: req.signal }, event => events.push(event));
+    const translated = buildResponseJSON(events, route.slug, { hideThinkingSummary: true });
+    const summary = compactSummaryFromResponse(translated);
+    const input = parsed._rawBody && typeof parsed._rawBody === "object" && !Array.isArray(parsed._rawBody)
+      ? (parsed._rawBody as { input?: unknown }).input
+      : raw.input;
+    return Response.json({ output: buildCompactV1Output(extractCompactUserMessages(input), summary) });
+  } catch (error) {
+    return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
+  }
 }
 
 export interface AppServer {
