@@ -72,8 +72,6 @@ Download the architecture-matching offline setup from the
 [latest release](https://github.com/miuuyy/codex-chatgpt-web/releases/latest):
 
 - `codex-chatgpt-web-windows-x64-setup.exe` for Intel/AMD Windows
-- `codex-chatgpt-web-windows-arm64-setup.exe` for Windows ARM64
-
 Double-click it, choose **Install**, and leave **Launch Codex ChatGPT Web now** checked. The native
 Windows control center handles both browser-only and full-harness setup; you do not need to run the
 setup CLI for normal use.
