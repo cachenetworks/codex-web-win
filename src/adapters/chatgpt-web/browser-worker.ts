@@ -401,11 +401,19 @@ export function chatGptPromptFilePayloads(
 export class ChatGptBrowserWorker {
   static forProvider(provider: CodexProviderConfig): ChatGptBrowserWorker {
     const config = resolveBrowserConfig(provider);
-    const key = JSON.stringify(config);
+    // Compaction is routed with localToolsEnabled=false. It must not share the
+    // serialized BrowserWorker tail owned by a long-lived local-tool turn:
+    // Codex may wait for compaction while that interactive browser turn is
+    // itself waiting for Codex, producing a circular wait.
+    const lane = provider.chatgptWeb?.localToolsEnabled === false
+      ? "read-only"
+      : "interactive";
+    const key = JSON.stringify({ lane, config });
     let worker = workers.get(key);
     if (!worker) {
       worker = new ChatGptBrowserWorker(config);
       workers.set(key, worker);
+      console.info(`[chatgpt-web] browser worker created lane=${lane}`);
     }
     return worker;
   }
@@ -1754,14 +1762,14 @@ export class ChatGptBrowserWorker {
         .sort(([left], [right]) => left === right
           ? 0
           : left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1)
-        .map(([candidate, kind]) => ({ kind, text: candidate.innerText.trim() }))
+        .map(([candidate, kind]) => ({ kind, text: (candidate.innerText ?? candidate.textContent ?? "").trim() }))
         .filter(block => block.text.length > 0)
         .filter((block, index, blocks) => (
           blocks.findIndex(other => other.kind === block.kind && other.text === block.text) === index
         ));
       return {
         responsePresent: true,
-        visibleText: rendered?.innerText.trim() ?? "",
+        visibleText: (rendered?.innerText ?? rendered?.textContent ?? "").trim(),
         fullHtml: rendered?.innerHTML ?? "",
         stableHtml: renderedChildren.slice(0, -1).map(child => child.outerHTML).join(""),
         completionActionVisible: completionAction !== undefined,
@@ -1788,10 +1796,10 @@ export class ChatGptBrowserWorker {
             testId: candidate.getAttribute("data-testid"),
             ariaLabel: candidate.getAttribute("aria-label"),
             title: candidate.getAttribute("title"),
-            text: candidate.innerText.trim().slice(0, 500),
+            text: (candidate.innerText ?? candidate.textContent ?? "").trim().slice(0, 500),
           }));
         return {
-          text: root.innerText.trim().slice(0, 2_000),
+          text: (root.innerText ?? root.textContent ?? "").trim().slice(0, 2_000),
           descriptors,
         };
       })
@@ -1810,7 +1818,7 @@ export class ChatGptBrowserWorker {
             role: candidate.getAttribute("role"),
             testId: candidate.getAttribute("data-testid"),
             ariaLabel: candidate.getAttribute("aria-label"),
-            text: candidate.innerText.trim().slice(0, 1_000),
+            text: (candidate.innerText ?? candidate.textContent ?? "").trim().slice(0, 1_000),
           };
         })
     )).catch(() => [] as Array<Record<string, string | null>>);

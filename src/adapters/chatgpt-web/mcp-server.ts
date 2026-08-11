@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
 import { namespacedToolName, type CodexTool } from "../../types";
+import { BRIDGE_COMPACTION_READ_WIRE, readLocalCompactionSnapshot } from "../../responses/compaction-snapshot";
 import type { ChatGptTurnEnvironment } from "./environment";
 import { callTurnBroker, type BrokerToolResult } from "./turn-broker";
 
@@ -17,9 +18,31 @@ interface ResolvedTurn {
 
 const bindingSchema = z.string().min(20).max(256).describe("Opaque binding_id returned by codex_bind_turn.");
 const jsonArgumentsSchema = z.record(z.string(), z.unknown()).default({});
+export const SHARED_TUNNEL_ROUTE_MISS = "CODEX_SHARED_TUNNEL_ROUTE_MISS";
 
 function scopeHash(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+export function requestOwnershipScopeKey(extra: { sessionId?: string; _meta?: unknown }): string | undefined {
+  const meta = extra._meta && typeof extra._meta === "object" && !Array.isArray(extra._meta)
+    ? extra._meta as Record<string, unknown>
+    : undefined;
+  const openAiSession = typeof meta?.["openai/session"] === "string" ? meta["openai/session"] : undefined;
+  const source = extra.sessionId || openAiSession;
+  return source ? scopeHash(source) : undefined;
+}
+
+export function isPotentialNonOwnerBrokerError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  // Only capability lookup misses are ambiguous under redundant tunnel
+  // pollers. Broker availability/timeouts are real local failures and must not
+  // be disguised as routing misses.
+  return /turn token is invalid, expired, or revoked|binding id is invalid or expired/i.test(message);
+}
+
+export function shouldReroutePotentialNonOwner(error: unknown, capabilityOwnedHere: boolean): boolean {
+  return isPotentialNonOwnerBrokerError(error) && !capabilityOwnedHere;
 }
 
 function requestScopeSummary(extra: {
@@ -99,7 +122,12 @@ export interface GatewayNestedTool {
   freeform: boolean;
 }
 
-const GATEWAY_INVENTORY_CACHE_TTL_MS = 1_000;
+// The outer Codex tool registry is stable for one bound turn. A one-second
+// cache caused repeated ALL_TOOLS probes whenever the web model paused between
+// inventory and invocation, wasting both latency and web-context tokens. Keep a
+// modest cache while still fingerprinting the directly advertised tool set so
+// environment/tool changes naturally invalidate it.
+const GATEWAY_INVENTORY_CACHE_TTL_MS = 60_000;
 
 export function shellCommandInvocationArgs(options: {
   cmd: string;
@@ -299,15 +327,70 @@ export function waitCellInvocationArgs(options: {
 
 export async function runChatGptMcpServer(options: { brokerSocketPath: string }): Promise<void> {
   const server = new McpServer({ name: "codex-native", version: "4.0.0" });
+  // A connector/session id is broader than one Codex turn. In redundant
+  // same-tunnel deployments the same ChatGPT session can legitimately dispatch
+  // consecutive turns to different machines, so remembering ownership by MCP
+  // session scope causes false "local expiry" classifications on non-owners.
+  // Track only capabilities this exact broker process has successfully claimed.
+  // Hashes avoid retaining bearer capability values in the MCP child longer than
+  // the broker needs them.
+  const ownedTurnTokens = new Map<string, number>();
+  const ownedBindingIds = new Map<string, number>();
   const gatewayInventoryCache = new Map<string, {
     fingerprint: string;
     createdAt: number;
     tools: Promise<GatewayNestedTool[]>;
   }>();
 
-  const environment = async (bindingId: string): Promise<ChatGptTurnEnvironment & { expiresAt: number }> => {
-    const resolved = await callTurnBroker<ResolvedTurn>(options.brokerSocketPath, { method: "resolve", bindingId });
+  const capabilityKey = (value: string) => createHash("sha256").update(value).digest("hex");
+
+  const pruneOwnedCapabilities = () => {
+    const now = Date.now();
+    for (const [key, expiresAt] of ownedTurnTokens) {
+      if (expiresAt <= now) ownedTurnTokens.delete(key);
+    }
+    for (const [key, expiresAt] of ownedBindingIds) {
+      if (expiresAt <= now) ownedBindingIds.delete(key);
+    }
+  };
+
+  const rememberOwnedCapability = (store: Map<string, number>, value: string, expiresAt: number) => {
+    pruneOwnedCapabilities();
+    store.set(capabilityKey(value), expiresAt);
+  };
+
+  const ownsCapability = (store: Map<string, number>, value: string): boolean => {
+    pruneOwnedCapabilities();
+    return store.has(capabilityKey(value));
+  };
+
+  const reroutePotentialNonOwner = (
+    error: unknown,
+    extra: { sessionId?: string; _meta?: unknown },
+    capabilityOwnedHere: boolean,
+  ): unknown => {
+    if (!shouldReroutePotentialNonOwner(error, capabilityOwnedHere)) return error;
+    const scopeKey = requestOwnershipScopeKey(extra);
+    console.warn(`[chatgpt-web-mcp] shared-tunnel route miss scope=${scopeKey ?? "unknown"}`);
+    return new Error(
+      `${SHARED_TUNNEL_ROUTE_MISS}: this tunnel-client process does not own the Codex turn for scope=${scopeKey ?? "unknown"}. `
+      + "Retry the exact same Codex Native tool call unchanged; a fresh tunnel command can be claimed by the owning redundant poller. "
+      + "Do not regenerate or alter turn_token or binding_id.",
+    );
+  };
+
+  const environment = async (
+    bindingId: string,
+    extra: { signal?: AbortSignal; sessionId?: string; _meta?: unknown },
+  ): Promise<ChatGptTurnEnvironment & { expiresAt: number }> => {
+    let resolved: ResolvedTurn;
+    try {
+      resolved = await callTurnBroker<ResolvedTurn>(options.brokerSocketPath, { method: "resolve", bindingId });
+    } catch (error) {
+      throw reroutePotentialNonOwner(error, extra, ownsCapability(ownedBindingIds, bindingId));
+    }
     if (resolved.environment.expiresAt <= Date.now()) throw new Error("Codex turn binding expired");
+    rememberOwnedCapability(ownedBindingIds, bindingId, resolved.environment.expiresAt);
     return resolved.environment;
   };
 
@@ -417,28 +500,40 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     },
     async ({ turn_token }, extra) => {
       console.error(`[chatgpt-web-mcp] codex_bind_turn scope=${requestScopeSummary(extra)}`);
-      const claimed = await callTurnBroker<ClaimedTurn>(options.brokerSocketPath, { method: "claim", token: turn_token });
+      let claimed: ClaimedTurn;
+      try {
+        claimed = await callTurnBroker<ClaimedTurn>(options.brokerSocketPath, { method: "claim", token: turn_token });
+      } catch (error) {
+        throw reroutePotentialNonOwner(error, extra, ownsCapability(ownedTurnTokens, turn_token));
+      }
+      rememberOwnedCapability(ownedTurnTokens, turn_token, claimed.environment.expiresAt);
+      rememberOwnedCapability(ownedBindingIds, claimed.bindingId, claimed.environment.expiresAt);
       const commandTool = exactTool(claimed.environment, "exec_command") ?? exactTool(claimed.environment, "shell_command");
       const gateway = execGateway(claimed.environment);
-      // The exec description may intentionally omit deferred tools. Bind is the
-      // capability handshake ChatGPT relies on before its first native action,
-      // so report the same live ALL_TOOLS surface that codex_tool_inventory uses
-      // instead of under-counting whatever happened to fit in gateway prose.
-      const discovered = gateway ? await discoverGatewayTools(claimed.bindingId, claimed.environment) : [];
+      // Keep binding a pure ownership/capability handshake. Live ALL_TOOLS
+      // discovery can execute a nested native round and previously made the
+      // mandatory bootstrap vulnerable to long tool-registry stalls. Inventory
+      // still performs live discovery on demand; bind reports the declarations
+      // already advertised by the gateway without blocking on another call.
+      const discovered = gateway ? gatewayNestedTools(claimed.environment) : [];
       const commandToolName = resolveCommandToolNameFromInventory(claimed.environment, discovered);
-      const hasNativeTool = (name: string) => Boolean(
-        exactTool(claimed.environment, name) ?? discovered.find(tool => tool.wireName === name),
-      );
       const directToolNames = new Set(claimed.environment.tools.map(tool => wireName(tool)));
       const nestedToolNames = new Set(discovered
         .map(tool => tool.wireName)
         .filter(name => !directToolNames.has(name)));
+      const hasWireTool = (name: string) => directToolNames.has(name) || nestedToolNames.has(name);
       const capabilities = ["native_tool_loop", "tool_registry"];
       if (commandToolName) capabilities.push("exec");
-      if (hasNativeTool("write_stdin") || hasNativeTool("wait")) capabilities.push("session_history");
-      if (hasNativeTool("wait")) capabilities.push("session_termination");
-      if (hasNativeTool("apply_patch")) capabilities.push("apply_patch");
-      if (hasNativeTool("view_image")) capabilities.push("images");
+      if (hasWireTool("write_stdin") || hasWireTool("wait")) capabilities.push("session_history");
+      if (hasWireTool("wait")) capabilities.push("session_termination");
+      if (hasWireTool("apply_patch")) capabilities.push("apply_patch");
+      if (hasWireTool("view_image")) capabilities.push("images");
+      if (hasWireTool("request_user_input")) capabilities.push("user_input");
+      if (hasWireTool("update_plan")) capabilities.push("planning");
+      if (hasWireTool("web__run")) capabilities.push("web");
+      if (hasWireTool("list_mcp_resources") && hasWireTool("read_mcp_resource")) capabilities.push("mcp_resources");
+      if (hasWireTool("collaboration__spawn_agent")) capabilities.push("collaboration");
+      if (hasWireTool("create_goal") && hasWireTool("update_goal")) capabilities.push("goals");
       return result({
         binding_id: claimed.bindingId,
         harness_version: 4,
@@ -484,9 +579,11 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     },
     async ({ binding_id, cmd, workdir, yield_time_ms, timeout_ms, max_output_tokens, tty }, extra) => {
       console.error(`[chatgpt-web-mcp] codex_exec scope=${requestScopeSummary(extra)}`);
-      const bound = await environment(binding_id);
+      const bound = await environment(binding_id, extra);
       const tool = exactTool(bound, "exec_command") ?? exactTool(bound, "shell_command");
-      const discovered = tool ? [] : await discoverGatewayTools(binding_id, bound);
+      const declared = tool ? [] : gatewayNestedTools(bound);
+      const declaredCommandName = tool?.name ?? resolveCommandToolNameFromInventory(bound, declared);
+      const discovered = tool || declaredCommandName ? declared : await discoverGatewayTools(binding_id, bound);
       const commandName = tool?.name ?? resolveCommandToolNameFromInventory(bound, discovered);
       if (!commandName) throw new Error("This Codex turn did not advertise exec_command, shell_command, or a compatible native exec gateway");
       const nestedResumable = !tool && resolveSessionContinuationToolNameFromInventory(bound, discovered) !== undefined;
@@ -530,11 +627,15 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ binding_id, session_id, chars, yield_time_ms, max_output_tokens, terminate }) => {
-      const bound = await environment(binding_id);
+    async ({ binding_id, session_id, chars, yield_time_ms, max_output_tokens, terminate }, extra) => {
+      const bound = await environment(binding_id, extra);
       const tool = exactTool(bound, "write_stdin");
       const directWait = tool ? undefined : exactTool(bound, "wait");
-      const discovered = tool || directWait ? [] : await discoverGatewayTools(binding_id, bound);
+      const declared = tool || directWait ? [] : gatewayNestedTools(bound);
+      const declaredContinuation = tool || directWait
+        ? undefined
+        : resolveSessionContinuationToolNameFromInventory(bound, declared);
+      const discovered = tool || directWait || declaredContinuation ? declared : await discoverGatewayTools(binding_id, bound);
       const nestedWrite = discovered.find(candidate => candidate.wireName === "write_stdin");
       const nestedWait = nestedWrite ? undefined : discovered.find(candidate => candidate.wireName === "wait");
       if (!tool && !directWait && !nestedWrite && !nestedWait) {
@@ -582,8 +683,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       inputSchema: { binding_id: bindingSchema, patch: z.string().min(1).max(5_000_000) },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ binding_id, patch }) => {
-      const bound = await environment(binding_id);
+    async ({ binding_id, patch }, extra) => {
+      const bound = await environment(binding_id, extra);
       const tool = exactTool(bound, "apply_patch");
       if (!tool) return invokeNestedNative(binding_id, bound, "apply_patch", true, { input: patch });
       return tool.freeform
@@ -604,8 +705,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ binding_id, path, detail }) => {
-      const bound = await environment(binding_id);
+    async ({ binding_id, path, detail }, extra) => {
+      const bound = await environment(binding_id, extra);
       const tool = exactTool(bound, "view_image");
       const payload = { arguments: { path, ...(detail ? { detail } : {}) } };
       return tool
@@ -628,8 +729,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ binding_id, query, offset, limit, include_schema }) => {
-      const bound = await environment(binding_id);
+    async ({ binding_id, query, offset, limit, include_schema }, extra) => {
+      const bound = await environment(binding_id, extra);
       const direct = bound.tools.map(tool => ({
         wire_name: wireName(tool),
         name: tool.name,
@@ -639,7 +740,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
         ...(include_schema ? { parameters: tool.parameters } : {}),
       }));
       const directNames = new Set(direct.map(tool => tool.wire_name));
-      const nested = (await discoverGatewayTools(binding_id, bound))
+      const mapNested = (tools: GatewayNestedTool[]) => tools
         .filter(tool => !directNames.has(tool.wireName))
         .map(tool => ({
           wire_name: tool.wireName,
@@ -652,7 +753,25 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
             : {}),
           ...(include_schema && tool.declaration ? { declaration: tool.declaration } : {}),
         }));
+      const declaredNested = mapNested(gatewayNestedTools(bound));
       const needle = query?.trim().toLowerCase();
+      // Exact-name lookups are the dominant model path and are already complete
+      // when the tool is directly advertised or present in the gateway
+      // declaration. Avoid a full deferred ALL_TOOLS round in that case.
+      const exactKnown = needle
+        ? [...direct, ...declaredNested].filter(tool => (
+            tool.wire_name.toLowerCase() === needle || tool.name.toLowerCase() === needle
+          ))
+        : [];
+      if (exactKnown.length > 0) {
+        const page = exactKnown.slice(offset, offset + limit);
+        return result({
+          tools: page,
+          total: exactKnown.length,
+          next_offset: offset + page.length < exactKnown.length ? offset + page.length : null,
+        });
+      }
+      const nested = mapNested(await discoverGatewayTools(binding_id, bound));
       const matches = [...direct, ...nested].filter(tool => !needle || [
         tool.wire_name,
         tool.name,
@@ -684,12 +803,32 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    async ({ binding_id, wire_name, arguments: args, input, yield_time_ms, max_output_tokens }) => {
-      const bound = await environment(binding_id);
+    async ({ binding_id, wire_name, arguments: args, input, yield_time_ms, max_output_tokens }, extra) => {
+      const bound = await environment(binding_id, extra);
+
+      // V15.1 bridge-private history recovery. This stays behind the existing
+      // codex_tool_call schema, so the ChatGPT plugin does not gain a new action.
+      if (wire_name === BRIDGE_COMPACTION_READ_WIRE) {
+        if (input !== undefined) {
+          throw new Error(`${BRIDGE_COMPACTION_READ_WIRE} accepts JSON arguments, not freeform input`);
+        }
+        const snapshotId = typeof args?.snapshot_id === "string" ? args.snapshot_id : "";
+        const query = typeof args?.query === "string" ? args.query : undefined;
+        const offset = typeof args?.offset === "number" ? args.offset : undefined;
+        const maxChars = typeof args?.max_chars === "number" ? args.max_chars : undefined;
+        const page = await readLocalCompactionSnapshot({
+          snapshotId,
+          ...(query !== undefined ? { query } : {}),
+          ...(offset !== undefined ? { offset } : {}),
+          ...(maxChars !== undefined ? { maxChars } : {}),
+        });
+        return result({ bridge_tool: BRIDGE_COMPACTION_READ_WIRE, read_only: true, ...page });
+      }
       const tool = bound.tools.find(candidate => wireName(candidate) === wire_name);
+      const declaredNested = tool ? undefined : gatewayNestedTool(bound, wire_name);
       const nested = tool
         ? undefined
-        : (await discoverGatewayTools(binding_id, bound)).find(candidate => candidate.wireName === wire_name);
+        : declaredNested ?? (await discoverGatewayTools(binding_id, bound)).find(candidate => candidate.wireName === wire_name);
       if (!tool && !nested) throw new Error(`Codex tool is not available in this turn: ${wire_name}`);
       const freeform = tool?.freeform === true || nested?.freeform === true;
       if (freeform) {

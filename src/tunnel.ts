@@ -206,10 +206,11 @@ function errorMessage(error: unknown): string {
 }
 
 export async function negotiateTunnelSession(operations: TunnelSessionOperations): Promise<TunnelSession> {
-  // Clean up an interrupted earlier launcher before creating a runtime owned by
-  // this foreground session.
-  await operations.stop();
   try {
+    // `runtimes connect` is deliberately StartOrReuse upstream. Let it reuse a
+    // healthy local runtime instead of unconditionally tearing down its stdio
+    // MCP child first; a forced stop can cancel an in-flight tunnel response
+    // and defeats redundant/same-tunnel operation during launcher restarts.
     await operations.start();
     const status = await operations.status();
     if (!status.ok) throw new Error(`Tunnel runtime did not become healthy and ready: ${status.detail}`);

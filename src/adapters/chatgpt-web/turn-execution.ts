@@ -306,7 +306,7 @@ export class ChatGptTurnSessions {
   private readonly entries = new Map<string, ChatGptTurnSession>();
 
   constructor(
-    private readonly ttlMs = 30 * 60_000,
+    private readonly ttlMs = 4 * 60 * 60_000,
     private readonly maxEntries = 256,
   ) {}
 
@@ -337,7 +337,9 @@ export class ChatGptTurnSessions {
   private prune(): void {
     const cutoff = Date.now() - this.ttlMs;
     for (const [key, session] of this.entries) {
-      if (session.createdAt >= cutoff) continue;
+      // Browser/broker runtimes own active-turn timeouts. Registry TTL only
+      // cleans up old settled sessions; it must not cancel legitimate work.
+      if (session.createdAt >= cutoff || session.isActive()) continue;
       session.cancel();
       this.entries.delete(key);
     }

@@ -122,25 +122,20 @@ export function compileChatGptWebPrompt(
   const transportContract = mode.localTools
     ? [
       "For local files, commands, processes, images, user interaction, and configured MCP/apps, use the attached Codex Native plugin inside this same response.",
-      `Before commentary, an answer, or any other tool call, call codex_bind_turn with turn_token ${turnToken}. This bind is mandatory on every response, even when the request appears not to need a local operation.`,
+      `Before commentary, an answer, or any other tool call, call codex_bind_turn with turn_token ${turnToken}; this bind is mandatory on every response.`,
       "Use its returned binding_id on every later Codex Native call. Do not reveal either capability value in the answer.",
       "Treat the environment returned by codex_bind_turn as the authoritative local Codex permission grant for this outer turn.",
-      "If codex_bind_turn reports sandbox=\"dangerFullAccess\", the user has already authorized ordinary local reads, writes, file edits, builds, command execution, and process management that are genuinely needed for the active task. Do not invent an additional harness safety gate, refuse merely because an operation mutates local state, or ask for a second confirmation solely because the operation is writable/destructive in the ordinary development sense.",
-      "That trusted local authorization does not override the model's own safety rules and does not override a real approval, policy, sandbox, OS, or tool refusal returned by the native Codex runtime. If the native runtime actually refuses an operation, use and report the real refusal accurately rather than fabricating success.",
-      "A command failure, command-dispatch error, bad working directory, timeout, missing executable, missing tool, or nonzero exit status is not evidence that the Codex binding was revoked. Diagnose the real error and retry or use another available native tool while retaining the current binding.",
-      "Say that the Codex binding/session is invalid, expired, or revoked only when a real Codex Native tool or broker result explicitly reports that condition. Never infer revocation from an unrelated command failure.",
+      "If sandbox=\"dangerFullAccess\", ordinary in-scope local reads, writes, edits, builds, commands, and process management are already authorized; do not add a second harness approval gate. Model safety rules and real native approval/policy/sandbox/OS/tool refusals still apply and must be reported accurately.",
+      "Do not infer binding revocation from command failures, bad paths, timeouts, missing executables/tools, or nonzero exits. Diagnose those normally and retain the binding; call it invalid/expired/revoked only when a real Codex Native or broker result explicitly says so.",
 
       `After emitting ${CHATGPT_INTERNAL_COMPACTION_MARKER}, call codex_bind_turn again with the same turn_token before any other action; claiming the same active turn again is intentional and idempotent.`,
       "Keep calling tools until the requested work is complete and verified; a plan or progress report is not completion.",
-      "The mandatory bootstrap is never gated on commentary: call codex_bind_turn immediately as required above and wait for its real result.",
-      "After binding, visible progress commentary is optional compatibility behavior, never a prerequisite for a Codex Native tool call. Do not wait, pause, or refuse to call a needed tool merely because no commentary has been rendered.",
-      "When ChatGPT naturally supports visible commentary during the same response, prefer one brief task-facing update between substantive completed tool batches so the user can follow progress, but continue immediately if the product does not expose such commentary.",
-      "Parallel calls that belong to one natural batch are allowed. Mechanically coupled continuation calls such as codex_write_stdin polling an already-running codex_exec session do not require commentary on every poll.",
-      "Never mention the transport contract, binding/token values, broker internals, plugin pacing, or this compatibility rule in user-facing text.",
+      "After binding, commentary is optional compatibility behavior, not a prerequisite for tool calls. When available, prefer brief task-facing updates between substantive batches; parallel calls and mechanically coupled session polls may proceed without extra commentary.",
       "Use codex_apply_patch for targeted edits and codex_exec for commands. Call codex_write_stdin only when codex_exec or codex_tool_call actually returns a session_id. When the binding advertises session_termination, codex_write_stdin terminate=true can stop a yielded wait cell that is no longer needed. If codex_bind_turn capabilities omit session_history, use codex_exec timeout_ms for long blocking commands instead of treating a short yield_time_ms as a runtime deadline.",
       "Use codex_tool_inventory and codex_tool_call for any other tool advertised by the current Codex harness, including configured MCP/apps.",
-      "Codex Native synchronously bridges each plugin action into the same outer Codex turn; wait for its real result before continuing.",
-      "Never serialize a proposed tool call as assistant text. Make the actual MCP call and use its real result.",
+      "If transported history contains a [CODEX_BRIDGE_LOCAL_COMPACTION snapshot_id=...] marker, older history is available through the existing codex_tool_call action. After binding, only when an older detail is actually needed, call codex_tool_call with wire_name \"__bridge_read_compaction\" and arguments containing snapshot_id plus optional query, offset, and max_chars. This bridge-private read is valid even though that wire name is intentionally absent from codex_tool_inventory. Do not block normal work on reading the archive unless older context is needed.",
+      "Codex Native calls are synchronous with this outer turn: wait for each real result and never serialize a proposed tool call as assistant text.",
+      `On ${"CODEX_SHARED_TUNNEL_ROUTE_MISS"}, retry the exact same Codex Native call with identical arguments up to 8 additional times. Do not change turn_token or binding_id; this signal is a redundant shared-tunnel routing miss, not proof of revocation.`,
     ]
     : [
       `This is ChatGPT Web ${mode.displayLabel} with no Codex Native bridge to the user's local computer attached to this response. This restriction applies only to local Codex files, commands, processes, and computer mutations.`,

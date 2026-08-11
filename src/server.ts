@@ -24,6 +24,7 @@ import {
 import { forwardNativeCodexRequest, type NativeFetch } from "./native-passthrough";
 import { parseRequest } from "./responses/parser";
 import { buildCompactV1Output, COMPACT_PROMPT, extractCompactUserMessages } from "./responses/compaction";
+import { createLocalCompactionSnapshot } from "./responses/compaction-snapshot";
 import { expandPreviousResponseInput, flushResponseState, rememberResponseState } from "./responses/state";
 import { normalizeCodexTurnMetadata } from "./responses/turn-metadata";
 import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "./types";
@@ -189,6 +190,68 @@ function compactSummaryFromResponse(response: Record<string, unknown>): string {
   return summary;
 }
 
+async function localCompactionV2Response(
+  parsed: CodexParsedRequest,
+  route: ChatGptWebModelRoute,
+): Promise<Response> {
+  const snapshot = await createLocalCompactionSnapshot(parsed._rawBody ?? {}, {
+    kind: "responses-v2",
+    model: route.slug,
+  });
+  console.info(
+    "[chatgpt-web] local compaction v2 snapshot="
+    + snapshot.snapshotId
+    + " archivedChars="
+    + String(snapshot.archivedChars)
+    + " recentChars="
+    + String(snapshot.recentChars),
+  );
+
+  const events: AdapterEvent[] = [
+    { type: "text_delta", text: snapshot.manifest },
+    { type: "done" },
+  ];
+  const maps = toolBridgeMaps(parsed);
+
+  if (parsed.stream) {
+    const queue = new AsyncEventQueue<AdapterEvent>();
+    for (const event of events) queue.push(event);
+    queue.close();
+    const stream = bridgeToResponsesSSE(
+      queue,
+      route.slug,
+      maps.toolNsMap,
+      maps.freeformToolNames,
+      maps.toolSearchToolNames,
+      undefined,
+      2_000,
+      {
+        hideThinkingSummary: true,
+        compaction: true,
+        onCompletedResponse: response => rememberResponseState(parsed._rawBody, response, { force: true }),
+      },
+    );
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+      },
+    });
+  }
+
+  const json = buildResponseJSON(events, route.slug, {
+    hideThinkingSummary: true,
+    toolNsMap: maps.toolNsMap,
+    freeformToolNames: maps.freeformToolNames,
+    toolSearchToolNames: maps.toolSearchToolNames,
+    compaction: true,
+  });
+  rememberResponseState(parsed._rawBody, json, { force: true });
+  return Response.json(json);
+}
+
 export async function responseRequest(req: Request, config: AppConfig): Promise<Response> {
   const nativeRequest = req.clone();
   let raw: unknown;
@@ -236,8 +299,17 @@ export async function responseRequest(req: Request, config: AppConfig): Promise<
 
   if (parsed._compactionRequest === true) prepareCompactionTurn(parsed);
 
+  if (parsed._compactionRequest === true) {
+    console.info("[chatgpt-web] V15.1 local v2 compaction route");
+    try {
+      return await localCompactionV2Response(parsed, route);
+    } catch (error) {
+      return formatErrorResponse(500, "server_error", error instanceof Error ? error.message : String(error));
+    }
+  }
+
   const adapter = createChatGptWebAdapter(
-    parsed._compactionRequest === true ? compactionProviderConfig(config) : providerConfig(config),
+    providerConfig(config),
   );
   try {
     await adapter.validateTurn?.(parsed, { headers: req.headers, abortSignal: req.signal });
@@ -281,7 +353,7 @@ export async function responseRequest(req: Request, config: AppConfig): Promise<
       2_000,
       {
         hideThinkingSummary: parsed.options.hideThinkingSummary,
-        compaction: parsed._compactionRequest === true,
+        compaction: false,
         onCompletedResponse: response => rememberResponseState(parsed._rawBody, response, { force: true }),
       },
     );
@@ -302,7 +374,7 @@ export async function responseRequest(req: Request, config: AppConfig): Promise<
     toolNsMap: maps.toolNsMap,
     freeformToolNames: maps.freeformToolNames,
     toolSearchToolNames: maps.toolSearchToolNames,
-    compaction: parsed._compactionRequest === true,
+    compaction: false,
   });
   rememberResponseState(parsed._rawBody, json, { force: true });
   return Response.json(json);
@@ -356,6 +428,30 @@ export async function compactRequest(req: Request, config: AppConfig): Promise<R
     return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
   }
 
+  console.info("[chatgpt-web] V15.1 local v1 compaction route");
+  try {
+    const snapshot = await createLocalCompactionSnapshot(parsed._rawBody ?? raw, {
+      kind: "responses-compact-v1",
+      model: route.slug,
+    });
+    const input = parsed._rawBody && typeof parsed._rawBody === "object" && !Array.isArray(parsed._rawBody)
+      ? (parsed._rawBody as { input?: unknown }).input
+      : raw.input;
+    console.info(
+      "[chatgpt-web] local compaction v1 snapshot="
+      + snapshot.snapshotId
+      + " archivedChars="
+      + String(snapshot.archivedChars)
+      + " recentChars="
+      + String(snapshot.recentChars),
+    );
+    return Response.json({
+      output: buildCompactV1Output(extractCompactUserMessages(input), snapshot.manifest),
+    });
+  } catch (error) {
+    return formatErrorResponse(500, "server_error", error instanceof Error ? error.message : String(error));
+  }
+
   const adapter = createChatGptWebAdapter(compactionProviderConfig(config));
   try {
     await adapter.validateTurn?.(parsed, { headers: req.headers, abortSignal: req.signal });
@@ -368,7 +464,8 @@ export async function compactRequest(req: Request, config: AppConfig): Promise<R
       : raw.input;
     return Response.json({ output: buildCompactV1Output(extractCompactUserMessages(input), summary) });
   } catch (error) {
-    return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
+    const message = error instanceof Error ? (error as Error).message : String(error);
+    return formatErrorResponse(502, "upstream_error", message);
   }
 }
 
