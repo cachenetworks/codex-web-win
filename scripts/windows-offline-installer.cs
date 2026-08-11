@@ -12,8 +12,8 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("Codex ChatGPT Web Setup")]
 [assembly: AssemblyProduct("Codex ChatGPT Web")]
-[assembly: AssemblyVersion("0.2.8.0")]
-[assembly: AssemblyFileVersion("0.2.8.0")]
+[assembly: AssemblyVersion("0.2.9.0")]
+[assembly: AssemblyFileVersion("0.2.9.0")]
 
 internal static class OfflineInstaller
 {

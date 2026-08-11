@@ -161,7 +161,11 @@ function realUserState(): Record<string, string> {
     appConfig: fingerprint(join(actualAppHome, "config.json")),
     integrationJournal: fingerprint(join(actualAppHome, "codex", "integration-journal.json")),
     codexConfig: fingerprint(join(actualCodexHome, "config.toml")),
-    codexModels: fingerprint(join(actualCodexHome, "models_cache.json")),
+    // models_cache.json is intentionally excluded: the already-running outer
+    // Codex app may refresh that volatile cache while this self-hosted smoke is
+    // executing. The installer/integration paths under test do not own it, and
+    // treating an unrelated refresh as leaked state makes package verification
+    // flaky precisely when the harness is rebuilt from inside Codex.
   };
 }
 

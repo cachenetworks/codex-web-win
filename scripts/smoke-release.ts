@@ -40,7 +40,7 @@ for (const forbidden of [sourceRoot, dirname(sourceBundle), "/private/tmp/codex-
 }
 
 const manifest = JSON.parse(readFileSync(join(runtimeRoot, "manifest.json"), "utf8")) as Record<string, unknown>;
-if (manifest.schemaVersion !== 1 || manifest.appVersion !== "0.2.8" || manifest.playwright !== "1.62.0"
+if (manifest.schemaVersion !== 1 || manifest.appVersion !== "0.2.9" || manifest.playwright !== "1.62.0"
   || manifest.platform !== process.platform || manifest.arch !== process.arch
   || manifest.launcher !== `bin/${launcherName}` || !existsSync(runtimeExecutable)
   || (process.platform === "win32"
@@ -62,7 +62,7 @@ const runtimeCommand = (args: string[]) => process.platform === "win32"
   ? [launcher, ...args]
   : [launcher, ...args];
 const version = Bun.spawnSync(launcherCommand(["--version"]), { stdout: "pipe", stderr: "pipe" });
-if (version.exitCode !== 0 || version.stdout.toString().trim() !== "0.2.8") {
+if (version.exitCode !== 0 || version.stdout.toString().trim() !== "0.2.9") {
   throw new Error(`Relocated launcher failed: ${version.stderr.toString()}`);
 }
 
@@ -75,7 +75,7 @@ const port = portServer.port;
 portServer.stop();
 const config = {
   version: 2,
-  releaseVersion: "0.2.8",
+  releaseVersion: "0.2.9",
   mode: "browser-only",
   host: "127.0.0.1",
   port,
