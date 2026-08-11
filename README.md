@@ -74,10 +74,20 @@ Download the architecture-matching offline setup from the
 - `codex-chatgpt-web-windows-x64-setup.exe` for Intel/AMD Windows
 - `codex-chatgpt-web-windows-arm64-setup.exe` for Windows ARM64
 
-Double-click it, choose **Install**, and leave **Launch Codex ChatGPT Web now** checked. In the
-native app, complete browser-only setup, sign in through the dedicated Chrome window, then close
-that Chrome window completely and choose **Start session**. Keep the app open while using the
-ChatGPT Web models.
+Double-click it, choose **Install**, and leave **Launch Codex ChatGPT Web now** checked. The native
+Windows control center handles both browser-only and full-harness setup; you do not need to run the
+setup CLI for normal use.
+
+For browser-only mode, keep **Browser-only (Recommended)** selected on the **Setup** tab, accept the
+unofficial-software notice, choose **Set up and sign in**, finish signing in through the dedicated
+Chrome window, close that Chrome window completely, then choose **Start session** on **Home**.
+
+For full harness, create the OpenAI tunnel and runtime key first, then select **Full mode (Advanced)**
+in the same **Setup** tab and enter them directly in the GUI. After setup, start the foreground
+session, attach and scan the connector while that session is running, and restart Codex once. See
+[Full harness on Windows](#full-harness-on-windows) below for the complete GUI flow.
+Keep the control center open while using the ChatGPT Web models; closing it stops the foreground
+runtime, controlled Chrome, and the full-mode tunnel.
 
 The per-user installer requires no administrator access and creates Start Menu plus optional
 Desktop shortcuts and an Apps & Features uninstall entry. It deliberately creates no service,
@@ -132,9 +142,91 @@ Full mode connects ChatGPT's tool calls back to the current Codex task through t
 [OpenAI tunnel-client](https://github.com/openai/tunnel-client). The tunnel is outbound: it does
 not expose a public IP, open an inbound port, or require router forwarding.
 
-The commands below show the macOS release path. On Windows, follow the
-[full-harness section of the Windows guide](docs/windows.md#full-harness-setup); the foreground GUI
-session owns the tunnel there.
+### Full harness on Windows
+
+The Windows control center can configure full mode end-to-end. The runtime and tunnel are
+foreground-owned, so keep the control center open whenever Codex is using the ChatGPT Web models.
+
+1. Before running setup, create a tunnel in
+   [Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels).
+2. Create a runtime key with **Tunnels Read + Use** in
+   [Platform API key settings](https://platform.openai.com/settings/organization/api-keys).
+3. Open **Codex ChatGPT Web** and go to **Setup**. Under **1. Choose a mode**, select
+   **Full mode (Advanced) - adds local tools through an OpenAI tunnel**.
+4. Under **2. Advanced full-mode credentials**, paste the `tunnel_...` id into **Tunnel ID** and
+   paste the runtime key into **Runtime key**. The key is passed to setup through redirected stdin;
+   it is not placed in command-line arguments or GUI logs.
+5. Under **3. Connection details**, keep **Connector name** as `Codex Native` unless you intend to
+   use a different matching name in ChatGPT. The default port and detected Chrome path normally do
+   not need changing. Leave **Automatically click per-call Allow once prompts** off unless you
+   explicitly want the bridge to accept those one-time prompts for you.
+6. Check the unofficial-software acknowledgement and choose **Set up and sign in**. When the
+   dedicated Chrome window opens, sign in to ChatGPT, confirm the composer is visible, then close
+   that Chrome window completely. Setup returns you to **Home** when it succeeds.
+7. On **Home**, choose **Start session**. Wait until the foreground runtime is healthy; in full mode
+   the Responses proxy starts first and the tunnel may take a little longer to become ready. Keep
+   this control-center window open.
+8. While that foreground session is running, complete the ChatGPT account-side app/connector setup
+   described in [Set up the Codex Native app in ChatGPT](#set-up-the-codex-native-app-in-chatgpt).
+   The **Settings & Support** tab has shortcuts to **ChatGPT Connectors**, **Tunnel settings**, and
+   **Runtime keys**.
+9. Restart Codex once, then choose a **ChatGPT Web - ...** model in Codex. Instant through Extra
+   High can call the current Codex task's local tools in full mode. Pro still receives the complete
+   accumulated task context but cannot initiate these local MCP/tool calls.
+
+If you rerun or repair full-mode setup later, the GUI can reuse already configured tunnel
+credentials; leave a credential field blank when the control center says that saved value is
+available. Use **Diagnostics > Run diagnostics** if the session or tunnel does not become ready.
+The advanced CLI equivalents remain documented in the
+[Windows setup guide](docs/windows.md#full-harness-setup).
+
+#### Set up the Codex Native app in ChatGPT
+
+This is the account-side part of full harness. In current ChatGPT terminology, the private MCP
+integration is a **custom app**; older UI and this project may also call it a **connector**. You do
+not need to find or install a public `Codex Native` listing from the Plugins Directory. You are
+creating a private custom MCP app that points at the tunnel started by the Windows control center.
+
+Keep **Codex ChatGPT Web** open with **Start session** running while you do these steps. The tunnel
+is foreground-owned on Windows, so ChatGPT cannot scan the app while the control center is closed.
+
+Before starting, check the account/workspace role. On Business, an admin/owner enables developer
+mode and creates the custom app. On Enterprise/Edu, an admin/owner can grant developer-mode access
+to authorized users, who then enable it for their own account. Pro can enable developer mode for a
+custom MCP app, but is limited to read/fetch MCP access rather than the full write-capable feature
+set.
+
+1. Open ChatGPT on the web and enable **Developer mode** for the account that will use the bridge.
+   When your account has permission, the toggle is under **Settings > Apps > Advanced Settings**;
+   workspace admins/owners may need to enable developer-mode access first.
+2. Open the custom app creation flow. Admins/owners can use **Workspace settings > Apps > Create**;
+   authorized users can use **Settings > Apps > Create** when their workspace permits developer
+   mode.
+3. Create the app with the same name used in the Windows GUI, normally `Codex Native`. Attach the
+   OpenAI tunnel created earlier to this custom MCP app/connector. If ChatGPT still labels this area
+   **Connectors**, use that equivalent create/attach flow.
+4. Choose **Scan Tools** and wait for the scan to finish. The Windows foreground session must still
+   be running. Confirm that the scanned tools belong to `Codex Native` before saving or creating the
+   app.
+5. Review the app's action permissions. Only enable the read, file, command, process, or other
+   actions you actually intend ChatGPT to use. Write/modify actions also depend on the ChatGPT plan,
+   workspace policy, and admin controls.
+6. Save/create the app. For private testing on the same authorized account, it can remain a
+   developer-mode app. If other workspace members need it, an admin/owner must publish or otherwise
+   enable the app for those members according to the workspace's app policy.
+7. Confirm the app appears under **Settings > Apps > Enabled Apps** (developer-mode apps may show a
+   **Dev** label), then return to Codex and restart Codex once before the first full-harness task.
+
+If the account cannot enable developer mode or the **Create** action is unavailable, check the
+workspace role and app policy rather than changing the local tunnel configuration. OpenAI currently
+documents full MCP, including write/modify actions, for Business and Enterprise/Edu workspaces.
+Pro accounts can use developer mode with custom MCP apps for read/fetch access, but not the full
+write-capable MCP feature set. See [developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)
+and [Apps in ChatGPT](https://help.openai.com/en/articles/11487775-connectors-in-chatgpt).
+
+### Full harness on macOS / CLI
+
+The commands below show the macOS release path:
 
 1. Create a tunnel in [Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels).
 2. Create a runtime key with **Tunnels Read + Use** in [Platform API key settings](https://platform.openai.com/settings/organization/api-keys).
