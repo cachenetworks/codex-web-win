@@ -111,8 +111,11 @@ curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/
 选项，但更改它们不会在后台静默切换所选的浏览器模型。Pro 会收到 Codex 已经收集的完整上下文，
 但 ChatGPT Pro 无法主动发起本地 MCP/工具调用。
 
-代理保留 Codex 内置的 `openai` provider 和实时模型目录。它会原样转发官方目录，只附加自己的
-ChatGPT Web 条目，因此原生模型、任务历史、审批、沙箱和工具结果仍由 Codex 管理。
+代理继续使用 Codex 内置的 `openai` provider 作为模型目录来源。在**仅浏览器**模式下，它只把
+官方目录用作元数据模板，只暴露新增的 ChatGPT Web 条目，并拒绝原生模型的 Responses/压缩转发；
+这样仅浏览器模式会安全地失败，而不会把任务静默切换到原生 Codex 后端。**完整 harness** 模式则
+继续保留原生模型目录和原生转发，并与 ChatGPT Web 模型同时可用。两种模式下，任务历史、审批、
+沙箱和工具结果仍由 Codex 管理。
 
 ## 完整 harness
 

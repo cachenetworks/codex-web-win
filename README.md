@@ -119,9 +119,12 @@ Every picker entry has one fixed ChatGPT mode. Codex still displays its built-in
 rows, but changing them cannot silently change the selected browser model. Pro receives the full
 context already collected by Codex, but ChatGPT Pro cannot initiate local MCP/tool calls.
 
-The proxy keeps Codex's built-in `openai` provider and live model catalog. It forwards the official
-catalog unchanged and appends only its ChatGPT Web entries, so native models, task history,
-approvals, sandboxing, and tool results remain owned by Codex.
+The proxy keeps Codex's built-in `openai` provider as the catalog source. In **browser-only** mode,
+it uses the official catalog only as a metadata template, exposes only the added ChatGPT Web
+entries, and rejects native-model Responses/compaction passthrough. This makes browser-only fail
+closed instead of silently switching a task onto the native Codex backend. **Full harness** mode
+keeps the native catalog entries and native passthrough available alongside the ChatGPT Web models.
+Task history, approvals, sandboxing, and tool results remain owned by Codex in both modes.
 
 ## Full harness
 
