@@ -290,6 +290,7 @@ export interface TunnelRuntimeStatus {
   healthy: boolean;
   ready: boolean;
   state?: string;
+  logPath?: string;
   detail: string;
 }
 
@@ -313,15 +314,22 @@ export function parseTunnelStatus(output: string, exitStatus = 0): TunnelRuntime
     const state = typeof parsed.runtime_state === "string" ? parsed.runtime_state
       : typeof parsed.status === "string" ? parsed.status
         : undefined;
-    const issues = parsed.local && typeof parsed.local === "object" && Array.isArray((parsed.local as { issues?: unknown }).issues)
-      ? ((parsed.local as { issues: unknown[] }).issues).filter(issue => typeof issue === "string").slice(0, 3)
+    const local = parsed.local && typeof parsed.local === "object" && !Array.isArray(parsed.local)
+      ? parsed.local as Record<string, unknown>
+      : undefined;
+    const issues = local && Array.isArray(local.issues)
+      ? local.issues.filter(issue => typeof issue === "string").slice(0, 3)
       : [];
+    const localLog = local?.log && typeof local.log === "object" && !Array.isArray(local.log)
+      ? local.log as Record<string, unknown>
+      : undefined;
+    const logPath = typeof localLog?.path === "string" && localLog.path.trim() ? localLog.path : undefined;
     const explicitError = typeof parsed.error === "string" && parsed.error ? parsed.error : undefined;
     const ok = processRunning && healthy && ready;
     const detail = ok
       ? "process_running=true healthy=true ready=true"
       : safeTunnelDetail([`process_running=${processRunning}`, `healthy=${healthy}`, `ready=${ready}`, ...(state ? [`state=${state}`] : []), ...(explicitError ? [explicitError] : []), ...issues].join("; "));
-    return { ok, processRunning, healthy, ready, ...(state ? { state } : {}), detail };
+    return { ok, processRunning, healthy, ready, ...(state ? { state } : {}), ...(logPath ? { logPath } : {}), detail };
   } catch {
     return { ok: false, processRunning: false, healthy: false, ready: false, detail: `tunnel-client returned non-JSON status: ${safeTunnelDetail(output)}` };
   }

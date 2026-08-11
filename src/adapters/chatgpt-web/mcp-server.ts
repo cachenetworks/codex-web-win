@@ -375,7 +375,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     return new Error(
       `${SHARED_TUNNEL_ROUTE_MISS}: this tunnel-client process does not own the Codex turn for scope=${scopeKey ?? "unknown"}. `
       + "Retry the exact same Codex Native tool call unchanged; a fresh tunnel command can be claimed by the owning redundant poller. "
-      + "Do not regenerate or alter turn_token or binding_id.",
+      + "Do not regenerate or alter turn_token or binding_id. If repeated misses persist, another computer is probably polling the same tunnel; "
+      + "each concurrently running computer needs its own tunnel ID and uniquely named ChatGPT custom app/connector.",
     );
   };
 

@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readSync, statSync } from "node:fs";
 import type { AppConfig } from "./config";
 import { getConfigPath, loadConfig } from "./config";
 import { inspectCodexIntegration } from "./codex-integration";
@@ -25,6 +25,24 @@ export interface DoctorReport {
 function secureFile(path: string): boolean {
   if (process.platform === "win32") return true;
   return (statSync(path).mode & 0o077) === 0;
+}
+
+export function recentSharedTunnelRouteMissCount(logPath: string, maxBytes = 2 * 1024 * 1024): number {
+  if (!existsSync(logPath) || maxBytes <= 0) return 0;
+  let fd: number | undefined;
+  try {
+    fd = openSync(logPath, "r");
+    const size = fstatSync(fd).size;
+    const bytes = Math.min(size, maxBytes);
+    if (bytes <= 0) return 0;
+    const buffer = Buffer.allocUnsafe(bytes);
+    readSync(fd, buffer, 0, bytes, Math.max(0, size - bytes));
+    return buffer.toString("utf8").split("[chatgpt-web-mcp] shared-tunnel route miss").length - 1;
+  } catch {
+    return 0;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 async function proxyCheck(config: AppConfig): Promise<DoctorCheck> {
@@ -142,6 +160,15 @@ export async function runDoctor(): Promise<DoctorReport> {
     checks.push(runtime.ok
       ? { id: "tunnel-runtime", status: "ok", message: "Tunnel runtime reports healthy and ready" }
       : { id: "tunnel-runtime", status: "error", message: "Tunnel runtime is not ready", detail: runtime.detail });
+    const sharedRouteMisses = runtime.logPath ? recentSharedTunnelRouteMissCount(runtime.logPath) : 0;
+    if (sharedRouteMisses > 0) {
+      checks.push({
+        id: "shared-tunnel-routing",
+        status: "warning",
+        message: `Tunnel log contains ${sharedRouteMisses} recent shared-tunnel ownership miss${sharedRouteMisses === 1 ? "" : "es"}`,
+        detail: "This tunnel is receiving Codex Native calls for turns owned by another local broker. Do not run the same tunnel/ChatGPT connector concurrently on multiple computers; give each computer its own tunnel ID and uniquely named ChatGPT custom app/connector.",
+      });
+    }
     checks.push({
       id: "connector",
       status: "warning",
