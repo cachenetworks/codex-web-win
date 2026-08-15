@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
+import { availableParallelism } from "node:os";
 import { join, resolve } from "node:path";
-import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright-core";
+import { chromium, type Browser, type BrowserContext, type CDPSession, type Locator, type Page } from "playwright-core";
 import { atomicWriteFile, defaultChromeExecutable, expandUserPath, getConfigDir } from "../../config";
 import type { CodexProviderConfig } from "../../types";
 import { parseDataUrl } from "../image";
@@ -19,6 +20,80 @@ export const DEFAULT_CHATGPT_TOOL_TURN_TIMEOUT_MS = 3 * 60 * 60_000;
 const MAX_CHATGPT_DELIVERY_TIMEOUT_RECOVERIES = 6;
 export const CHATGPT_RESPONSE_DOM_GRACE_MS = 30_000;
 export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000;
+export const CHATGPT_RESPONSE_POLL_MS = 1_250;
+export const CHATGPT_TOOL_WAIT_POLL_MS = 15_000;
+export const CHATGPT_UI_POLL_MS = 500;
+export const CHATGPT_TRACE_POLL_MS = 4_000;
+export const CHATGPT_RENDERER_TELEMETRY_MS = 15_000;
+export const CHATGPT_RECOVERY_SIGNAL_POLL_MS = 2_500;
+export const CHATGPT_CONSTRAINED_PARALLELISM = 4;
+const MAX_CHATGPT_TRACE_CANDIDATES = 48;
+const CHATGPT_RENDERER_TELEMETRY_ENV = "CODEX_CHATGPT_WEB_RENDERER_TELEMETRY";
+
+export interface ChatGptPollingProfile {
+  constrained: boolean;
+  responseMs: number;
+  uiMs: number;
+  traceMs: number;
+  recoveryMs: number;
+}
+
+export function chatGptPollingProfile(parallelism = availableParallelism()): ChatGptPollingProfile {
+  const constrained = parallelism <= CHATGPT_CONSTRAINED_PARALLELISM;
+  return constrained
+    ? {
+        constrained: true,
+        responseMs: 1_800,
+        uiMs: 750,
+        traceMs: 6_000,
+        recoveryMs: 4_000,
+      }
+    : {
+        constrained: false,
+        responseMs: CHATGPT_RESPONSE_POLL_MS,
+        uiMs: CHATGPT_UI_POLL_MS,
+        traceMs: CHATGPT_TRACE_POLL_MS,
+        recoveryMs: CHATGPT_RECOVERY_SIGNAL_POLL_MS,
+      };
+}
+
+const activeParallelism = availableParallelism();
+const activePollingProfile = chatGptPollingProfile(activeParallelism);
+
+export const CHATGPT_LOW_POWER_STYLE = `
+html { scroll-behavior: auto !important; }
+*, *::before, *::after {
+  animation-duration: 0.001ms !important;
+  animation-delay: 0ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  transition-delay: 0ms !important;
+}
+`;
+
+/**
+ * Playwright normally disables Chromium's background throttling so automation
+ * remains deterministic. That is actively harmful for long ChatGPT tool waits:
+ * an otherwise idle renderer can keep its timers/layout work running at full
+ * foreground cadence. Ignore only those Playwright defaults and leave every
+ * other launch default intact.
+ */
+export const CHATGPT_RESTORE_BACKGROUND_THROTTLING_ARGS = [
+  "--disable-background-timer-throttling",
+  "--disable-backgrounding-occluded-windows",
+  "--disable-renderer-backgrounding",
+] as const;
+
+/**
+ * The bridge never consumes rendered remote images from the ChatGPT page; input
+ * images are uploaded directly through the file chooser. Disabling image
+ * painting avoids image fetch/decode/raster work without installing a
+ * Playwright route (routing disables Chromium's HTTP cache and can make the
+ * whole app more expensive on repeat navigations).
+ */
+export const CHATGPT_LOW_RESOURCE_LAUNCH_ARGS = [
+  "--blink-settings=imagesEnabled=false",
+] as const;
 
 const browserStageTimeouts = {
   browserPage: 60_000,
@@ -45,6 +120,13 @@ export interface BrowserTurn {
   onCommentary?: (text: string, continuation?: boolean) => void;
   /** Append-only, structurally stable Markdown chunks. */
   onTextDelta: (delta: string) => void;
+  /** Exact number of Codex Native invocations currently waiting for local results. */
+  pendingToolCount?: () => number;
+  /**
+   * Event-driven wakeup for local tool activity. This lets constrained machines
+   * sleep for a long fallback interval without adding equivalent tool latency.
+   */
+  waitForPendingToolCountChange?: (previousCount: number, timeoutMs: number) => Promise<number>;
 }
 
 interface ResolvedBrowserConfig {
@@ -60,12 +142,12 @@ export function chatGptTurnIsComplete(state: {
   responsePresent: boolean;
   running: boolean;
   currentText: string;
-  completionActionVisible: boolean;
+  completionActionPresent: boolean;
 }): boolean {
   return state.responsePresent
     && !state.running
     && state.currentText.length > 0
-    && state.completionActionVisible;
+    && state.completionActionPresent;
 }
 
 export class ChatGptCompletionTracker {
@@ -109,7 +191,7 @@ export class ChatGptTurnDomHealthTracker {
     responsePresent: boolean;
     running: boolean;
     currentText: string;
-    completionActionVisible: boolean;
+    completionActionPresent: boolean;
   }, now = Date.now()): string | undefined {
     if (state.responsePresent) {
       this.sawResponse = true;
@@ -132,7 +214,7 @@ export class ChatGptTurnDomHealthTracker {
     const emptyCompletion = state.responsePresent
       && !state.running
       && state.currentText.length === 0
-      && state.completionActionVisible;
+      && state.completionActionPresent;
     if (!emptyCompletion) {
       this.emptyCompletionSince = undefined;
     } else {
@@ -158,23 +240,123 @@ export interface ChatGptVisibleTraceEvent {
 
 interface ChatGptResponseDomSnapshot {
   responsePresent: boolean;
+  running: boolean;
+  deliveryTimeoutPresent: boolean;
+  toolConfirmationPresent: boolean;
+  completionSignature: string;
   visibleText: string;
   visibleTextLength: number;
-  fullHtml: string;
-  stableHtml: string;
-  completionActionVisible: boolean;
+  completionActionPresent: boolean;
   traceBlocks: ChatGptVisibleTraceBlock[];
 }
 
 const absentResponseDomSnapshot = (): ChatGptResponseDomSnapshot => ({
   responsePresent: false,
+  running: false,
+  deliveryTimeoutPresent: false,
+  toolConfirmationPresent: false,
+  completionSignature: "",
   visibleText: "",
   visibleTextLength: 0,
-  fullHtml: "",
-  stableHtml: "",
-  completionActionVisible: false,
+  completionActionPresent: false,
   traceBlocks: [],
 });
+
+interface ChatGptRendererTelemetryPoint {
+  atMs: number;
+  taskDurationSeconds: number;
+  scriptDurationSeconds: number;
+  layoutDurationSeconds: number;
+}
+
+function metricValue(metrics: Array<{ name: string; value: number }>, name: string): number {
+  return metrics.find(metric => metric.name === name)?.value ?? 0;
+}
+
+function percentageDelta(current: number, previous: number, elapsedSeconds: number): string {
+  if (elapsedSeconds <= 0) return "n/a";
+  return (Math.max(0, current - previous) / elapsedSeconds * 100).toFixed(1);
+}
+
+/**
+ * Low-frequency CDP telemetry used only while ChatGPT is blocked on real local
+ * tool calls. It intentionally measures the renderer instead of the Node host:
+ * TaskDuration catches main-thread burn while heap/DOM counters expose the
+ * long-session growth that tends to make each DOM probe more expensive.
+ */
+class ChatGptRendererTelemetry {
+  private session?: CDPSession;
+  private previous?: ChatGptRendererTelemetryPoint;
+  private nextSampleAt = 0;
+  private disabled = false;
+
+  constructor(private readonly page: Page, private readonly traceId: string) {}
+
+  async sample(phase: "tool-wait-start" | "tool-wait" | "tool-wait-end", pendingTools: number, force = false): Promise<void> {
+    if (this.disabled) return;
+    const now = Date.now();
+    if (!force && now < this.nextSampleAt) return;
+    this.nextSampleAt = now + CHATGPT_RENDERER_TELEMETRY_MS;
+    try {
+      if (!this.session) {
+        this.session = await this.page.context().newCDPSession(this.page);
+        await this.session.send("Performance.enable");
+      }
+      const [performanceMetrics, domCounters] = await Promise.all([
+        this.session.send("Performance.getMetrics") as Promise<{ metrics: Array<{ name: string; value: number }> }>,
+        this.session.send("Memory.getDOMCounters") as Promise<{ documents: number; nodes: number; jsEventListeners: number }>,
+      ]);
+      const point: ChatGptRendererTelemetryPoint = {
+        atMs: now,
+        taskDurationSeconds: metricValue(performanceMetrics.metrics, "TaskDuration"),
+        scriptDurationSeconds: metricValue(performanceMetrics.metrics, "ScriptDuration"),
+        layoutDurationSeconds: metricValue(performanceMetrics.metrics, "LayoutDuration"),
+      };
+      const previous = this.previous;
+      const elapsedSeconds = previous ? Math.max(0.001, (point.atMs - previous.atMs) / 1_000) : 0;
+      const mainThreadCpuPct = previous
+        ? percentageDelta(point.taskDurationSeconds, previous.taskDurationSeconds, elapsedSeconds)
+        : "n/a";
+      const scriptCpuPct = previous
+        ? percentageDelta(point.scriptDurationSeconds, previous.scriptDurationSeconds, elapsedSeconds)
+        : "n/a";
+      const layoutCpuPct = previous
+        ? percentageDelta(point.layoutDurationSeconds, previous.layoutDurationSeconds, elapsedSeconds)
+        : "n/a";
+      const jsHeapUsedMiB = metricValue(performanceMetrics.metrics, "JSHeapUsedSize") / 1_048_576;
+      const jsHeapTotalMiB = metricValue(performanceMetrics.metrics, "JSHeapTotalSize") / 1_048_576;
+      console.info(
+        `[chatgpt-web] browser turn ${this.traceId} renderer telemetry phase=${phase} pendingTools=${pendingTools}`
+        + ` mainThreadCpuPct=${mainThreadCpuPct} scriptCpuPct=${scriptCpuPct} layoutCpuPct=${layoutCpuPct}`
+        + ` jsHeapMiB=${jsHeapUsedMiB.toFixed(1)}/${jsHeapTotalMiB.toFixed(1)}`
+        + ` documents=${domCounters.documents} nodes=${domCounters.nodes} listeners=${domCounters.jsEventListeners}`,
+      );
+      this.previous = point;
+    } catch (error) {
+      this.disabled = true;
+      console.warn(
+        `[chatgpt-web] browser turn ${this.traceId} renderer telemetry unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  async close(): Promise<void> {
+    const session = this.session;
+    this.session = undefined;
+    if (session) await session.detach().catch(() => {});
+  }
+}
+
+export function chatGptResponsePollInterval(
+  pendingToolCount: number,
+  responsePollMs = CHATGPT_RESPONSE_POLL_MS,
+): number {
+  return pendingToolCount > 0 ? CHATGPT_TOOL_WAIT_POLL_MS : responsePollMs;
+}
+
+export function chatGptRendererTelemetryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[CHATGPT_RENDERER_TELEMETRY_ENV]?.trim() === "1";
+}
 
 /** Convert the public ChatGPT turn DOM into append-only Codex reasoning summaries. */
 export class ChatGptVisibleTraceTracker {
@@ -184,7 +366,7 @@ export class ChatGptVisibleTraceTracker {
 
   constructor(private readonly commentaryStabilityMs = 1_000) {}
 
-  observe(blocks: ChatGptVisibleTraceBlock[], completionActionVisible: boolean, now = Date.now()): ChatGptVisibleTraceEvent[] {
+  observe(blocks: ChatGptVisibleTraceBlock[], completionActionPresent: boolean, now = Date.now()): ChatGptVisibleTraceEvent[] {
     let lastMarkdown = -1;
     for (let index = 0; index < blocks.length; index++) {
       if (blocks[index]!.kind === "markdown") lastMarkdown = index;
@@ -208,7 +390,7 @@ export class ChatGptVisibleTraceTracker {
       // The trailing Markdown root is ambiguous while running and becomes the final answer once
       // complete. It stays owned by ChatGptMarkdownStream; earlier roots are stable commentary.
       if (block.kind === "markdown"
-        && (completionActionVisible ? index === lastMarkdown : index === blocks.length - 1)) {
+        && (completionActionPresent ? index === lastMarkdown : index === blocks.length - 1)) {
         continue;
       }
       if (block.kind === "markdown") {
@@ -400,6 +582,66 @@ export function chatGptPromptFilePayloads(
   return chatGptImageFilePayloads(prompt.images);
 }
 
+class ChatGptSharedBrowser {
+  private browser?: Browser;
+  private launchPromise?: Promise<Browser>;
+
+  constructor(private readonly config: ResolvedBrowserConfig) {}
+
+  async get(): Promise<Browser> {
+    if (this.browser?.isConnected()) return this.browser;
+    if (this.launchPromise) return this.launchPromise;
+    const launch = chromium.launch({
+      executablePath: this.config.chromeExecutablePath,
+      headless: !this.config.headed,
+      env: childProcessEnvironment(),
+      ignoreDefaultArgs: [...CHATGPT_RESTORE_BACKGROUND_THROTTLING_ARGS],
+      args: [...CHATGPT_LOW_RESOURCE_LAUNCH_ARGS],
+    });
+    this.launchPromise = launch;
+    try {
+      const browser = await launch;
+      this.browser = browser;
+      browser.on("disconnected", () => {
+        if (this.browser === browser) this.browser = undefined;
+      });
+      return browser;
+    } finally {
+      if (this.launchPromise === launch) this.launchPromise = undefined;
+    }
+  }
+
+  discard(browser: Browser): void {
+    if (this.browser !== browser) return;
+    this.browser = undefined;
+    void browser.close().catch(() => {});
+  }
+
+  async close(): Promise<void> {
+    const launch = this.launchPromise;
+    this.launchPromise = undefined;
+    const launched = launch ? await launch.catch(() => undefined) : undefined;
+    const browser = this.browser ?? launched;
+    this.browser = undefined;
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+const sharedBrowsers = new Map<string, ChatGptSharedBrowser>();
+
+function sharedBrowserForConfig(config: ResolvedBrowserConfig): ChatGptSharedBrowser {
+  const key = JSON.stringify({
+    chromeExecutablePath: config.chromeExecutablePath,
+    headed: config.headed,
+  });
+  let shared = sharedBrowsers.get(key);
+  if (!shared) {
+    shared = new ChatGptSharedBrowser(config);
+    sharedBrowsers.set(key, shared);
+  }
+  return shared;
+}
+
 export class ChatGptBrowserWorker {
   static forProvider(provider: CodexProviderConfig): ChatGptBrowserWorker {
     const config = resolveBrowserConfig(provider);
@@ -413,19 +655,28 @@ export class ChatGptBrowserWorker {
     const key = JSON.stringify({ lane, config });
     let worker = workers.get(key);
     if (!worker) {
-      worker = new ChatGptBrowserWorker(config);
+      worker = new ChatGptBrowserWorker(config, sharedBrowserForConfig(config));
       workers.set(key, worker);
-      console.info(`[chatgpt-web] browser worker created lane=${lane}`);
+      console.info(
+        `[chatgpt-web] browser worker created lane=${lane}`
+        + ` parallelism=${activeParallelism}`
+        + ` constrained=${activePollingProfile.constrained}`
+        + ` responsePollMs=${activePollingProfile.responseMs}`
+        + ` tracePollMs=${activePollingProfile.traceMs}`,
+      );
     }
     return worker;
   }
 
-  private browser?: Browser;
   private context?: BrowserContext;
   private page?: Page;
   private tail: Promise<void> = Promise.resolve();
+  private lastStorageStateJson?: string;
 
-  private constructor(private readonly config: ResolvedBrowserConfig) {}
+  private constructor(
+    private readonly config: ResolvedBrowserConfig,
+    private readonly sharedBrowser: ChatGptSharedBrowser,
+  ) {}
 
   run(turn: BrowserTurn): Promise<string> {
     const run = this.tail.then(() => this.runExclusive(turn));
@@ -434,20 +685,18 @@ export class ChatGptBrowserWorker {
   }
 
   async close(): Promise<void> {
-    const browser = this.browser;
-    this.browser = undefined;
+    const context = this.context;
     this.context = undefined;
     this.page = undefined;
-    const closing = browser?.close().catch(() => {});
+    const closing = context?.close().catch(() => {});
     await Promise.allSettled([this.tail, closing]);
   }
 
-  private discardBrowser(): void {
-    const browser = this.browser;
-    this.browser = undefined;
+  private discardContext(): void {
+    const context = this.context;
     this.context = undefined;
     this.page = undefined;
-    if (browser) void browser.close().catch(() => {});
+    if (context) void context.close().catch(() => {});
   }
 
   private async runStage<T>(traceId: string, stage: string, timeoutMs: number, action: () => Promise<T>): Promise<T> {
@@ -467,7 +716,7 @@ export class ChatGptBrowserWorker {
       return value;
     } catch (error) {
       console.error(`[chatgpt-web] browser turn ${traceId} stage=${stage} failed durationMs=${Math.round(performance.now() - startedAt)}: ${error instanceof Error ? error.message : String(error)}`);
-      if (timedOut) this.discardBrowser();
+      if (timedOut) this.discardContext();
       throw error;
     } finally {
       if (timer) clearTimeout(timer);
@@ -482,12 +731,32 @@ export class ChatGptBrowserWorker {
     if (!existsSync(this.config.chromeExecutablePath)) {
       throw new Error(`Configured Chrome executable does not exist: ${this.config.chromeExecutablePath}`);
     }
-    this.browser = await chromium.launch({
-      executablePath: this.config.chromeExecutablePath,
-      headless: !this.config.headed,
-      env: childProcessEnvironment(),
+    if (this.context) {
+      try {
+        this.page = await this.context.newPage();
+        return this.page;
+      } catch {
+        this.discardContext();
+      }
+    }
+    const createContext = (browser: Browser) => browser.newContext({
+      storageState: this.config.storageStatePath,
+      // ChatGPT has several continuously animated surfaces while reasoning and
+      // invoking tools. Prefer the platform's reduced-motion path so Chromium
+      // spends less main-thread/GPU time animating UI the bridge never needs.
+      reducedMotion: "reduce",
     });
-    this.context = await this.browser.newContext({ storageState: this.config.storageStatePath });
+    let browser = await this.sharedBrowser.get();
+    try {
+      this.context = await createContext(browser);
+    } catch {
+      // If the shared Chrome process itself became unhealthy, replace it once.
+      // Other lanes already attached to it will observe the disconnect and
+      // recreate their isolated context on their next turn.
+      this.sharedBrowser.discard(browser);
+      browser = await this.sharedBrowser.get();
+      this.context = await createContext(browser);
+    }
     this.page = await this.context.newPage();
     return this.page;
   }
@@ -510,11 +779,18 @@ export class ChatGptBrowserWorker {
       return previous;
     } catch {
       // A renderer can become unhealthy after a very large turn. If the cheap
-      // in-place reset fails, discard the browser before creating a replacement
-      // so the old renderer is not kept alive alongside the new one.
-      this.discardBrowser();
+      // in-place reset fails, discard this lane's isolated browser context
+      // before creating a replacement so the old renderer is not kept alive.
+      this.discardContext();
       return this.ensurePage();
     }
+  }
+
+  private async applyLowPowerPageStyle(page: Page): Promise<void> {
+    // prefers-reduced-motion handles well-behaved components. This catches the
+    // remaining decorative transitions/animations in the web app without
+    // changing layout, interaction, or network behavior.
+    await page.addStyleTag({ content: CHATGPT_LOW_POWER_STYLE }).catch(() => {});
   }
 
   /**
@@ -625,7 +901,7 @@ export class ChatGptBrowserWorker {
         const deadline = Date.now() + 8_000;
         while (Date.now() < deadline) {
           if (!await pageIsWork()) break;
-          await page.waitForTimeout(100);
+          await page.waitForTimeout(activePollingProfile.uiMs);
         }
         if (await pageIsWork()) {
           throw new Error(`ChatGPT remained on Work after selecting Chat (url=${page.url()})`);
@@ -687,7 +963,7 @@ export class ChatGptBrowserWorker {
       while (Date.now() < deadline) {
         const visibleLabel = await currentEffort.innerText().catch(() => "");
         if (chatGptEffortLabelsMatch(visibleLabel, mode.uiEffortLabel)) return mode;
-        await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
+        await new Promise(resolveSleep => setTimeout(resolveSleep, activePollingProfile.uiMs));
       }
       throw new Error("effort control did not render the selected label");
     } catch {
@@ -709,8 +985,16 @@ export class ChatGptBrowserWorker {
   private async attachedPromptText(page: Page): Promise<string> {
     const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" });
     return composer.evaluate((element, appName) => {
-      const clone = element.cloneNode(true) as HTMLElement;
       const normalizedAppName = appName.replace(/\s+/g, " ").trim();
+      const connectorSelector = [
+        "[data-inline-selection-pill]",
+        "[data-inline-selection-pill-cursor-target]",
+        "[data-testid*='mention']",
+        "[data-testid*='connector']",
+        "[data-testid*='plugin']",
+        "a[role='link']",
+        "[contenteditable='false']",
+      ].join(", ");
       const connectorNames = (part: HTMLElement): string[] => {
         const withoutDecoration = part.cloneNode(true) as HTMLElement;
         withoutDecoration.querySelectorAll<HTMLElement>([
@@ -728,7 +1012,35 @@ export class ChatGptBrowserWorker {
           withoutDecoration.textContent ?? "",
         ].map(value => value.replace(/\s+/g, " ").trim().replace(/^@\s*/, ""));
       };
-      const connectorParts = clone.querySelectorAll<HTMLElement>([
+      const isConnectorPart = (part: HTMLElement): boolean =>
+        part.matches(connectorSelector)
+        && connectorNames(part).some(name => name === normalizedAppName);
+      const blockTags = new Set(["ADDRESS", "ARTICLE", "BLOCKQUOTE", "DIV", "LI", "P", "PRE"]);
+      const readNode = (node: Node, isRoot = false): string => {
+        if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+        if (!(node instanceof HTMLElement)) return "";
+        if (node.tagName === "BR") return "\n";
+        // Skip only the small connector subtree instead of cloning the entire
+        // potentially multi-hundred-kilobyte composer on every verification.
+        if (!isRoot && isConnectorPart(node)) return "";
+        const value = [...node.childNodes].map(child => readNode(child)).join("");
+        return !isRoot && blockTags.has(node.tagName) ? `${value}\n` : value;
+      };
+      return readNode(element, true).replace(/\n$/, "").trimStart();
+    }, this.config.appName, { timeout: 20_000 });
+  }
+
+  /**
+   * Cheap submission probe. While the prompt is still present this exits on
+   * the first non-whitespace text node instead of reconstructing the complete
+   * transported context merely to learn that the composer has not cleared.
+   */
+  private async composerHasUserText(composer: Locator): Promise<boolean> {
+    return composer.evaluate((element, appName) => {
+      const normalize = (value: string): string =>
+        value.replace(/\s+/g, " ").trim().replace(/^@\s*/, "").toLowerCase();
+      const target = normalize(appName);
+      const connectorSelector = [
         "[data-inline-selection-pill]",
         "[data-inline-selection-pill-cursor-target]",
         "[data-testid*='mention']",
@@ -736,21 +1048,27 @@ export class ChatGptBrowserWorker {
         "[data-testid*='plugin']",
         "a[role='link']",
         "[contenteditable='false']",
-      ].join(", "));
-      connectorParts.forEach(part => {
-        const names = connectorNames(part);
-        if (names.some(name => name === normalizedAppName)) part.remove();
-      });
-      const blockTags = new Set(["ADDRESS", "ARTICLE", "BLOCKQUOTE", "DIV", "LI", "P", "PRE"]);
-      const readNode = (node: Node, isRoot = false): string => {
-        if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
-        if (!(node instanceof HTMLElement)) return "";
-        if (node.tagName === "BR") return "\n";
-        const value = [...node.childNodes].map(child => readNode(child)).join("");
-        return !isRoot && blockTags.has(node.tagName) ? `${value}\n` : value;
+      ].join(", ");
+      const isConnectorPart = (part: HTMLElement): boolean => {
+        if (!part.matches(connectorSelector)) return false;
+        return [
+          part.getAttribute("aria-label") ?? "",
+          part.getAttribute("title") ?? "",
+          part.innerText ?? "",
+          part.textContent ?? "",
+        ].some(value => normalize(value) === target);
       };
-      return readNode(clone, true).replace(/\n$/, "").trimStart();
-    }, this.config.appName, { timeout: 20_000 });
+      const hasUserText = (node: Node, isRoot = false): boolean => {
+        if (node.nodeType === Node.TEXT_NODE) return /\S/.test(node.textContent ?? "");
+        if (!(node instanceof HTMLElement)) return false;
+        if (!isRoot && isConnectorPart(node)) return false;
+        for (const child of node.childNodes) {
+          if (hasUserText(child)) return true;
+        }
+        return false;
+      };
+      return hasUserText(element, true);
+    }, this.config.appName).catch(() => true);
   }
 
   private async assertPromptAttached(page: Page, prompt: string): Promise<void> {
@@ -759,7 +1077,7 @@ export class ChatGptBrowserWorker {
     while (Date.now() < deadline) {
       observed = await this.attachedPromptText(page);
       if (observed === prompt) return;
-      await new Promise(resolveSleep => setTimeout(resolveSleep, 50));
+      await new Promise(resolveSleep => setTimeout(resolveSleep, activePollingProfile.uiMs));
     }
     let commonPrefix = 0;
     while (commonPrefix < prompt.length && prompt[commonPrefix] === observed[commonPrefix]) commonPrefix += 1;
@@ -770,67 +1088,22 @@ export class ChatGptBrowserWorker {
 
   /** Return true when ChatGPT has already converted @appName into an inline pill. */
   private async connectorIsSelected(page: Page, composer: Locator): Promise<boolean> {
-    const candidates = [
-      composer.getByRole("link", { name: this.config.appName, exact: true }),
-      composer.locator([
-        "[data-inline-selection-pill]",
-        "[data-inline-selection-pill-cursor-target]",
-        "[data-testid*='mention']",
-        "[data-testid*='connector']",
-        "[data-testid*='plugin']",
-        "a[role='link']",
-        "[contenteditable='false']",
-        "[aria-label]",
-        "[title]",
-      ].join(", ")),
-      // Current ChatGPT can render the committed inline pill alongside the
-      // textbox, in the message-action shell rather than beneath the
-      // contenteditable node. Explicit inline-pill markers remain the strongest
-      // page-scope signal.
-      page.locator([
-        "[data-inline-selection-pill]",
-        "[data-inline-selection-pill-cursor-target]",
-      ].join(", ")),
-    ];
-    for (const locator of candidates) {
-      const count = await locator.count().catch(() => 0);
-      for (let index = count - 1; index >= 0; index--) {
-        const candidate = locator.nth(index);
-        const visible = await candidate.isVisible().catch(() => false);
-        if (!visible) continue;
-        const state = await candidate.evaluate(element => {
-          const html = element as HTMLElement;
-          const rect = html.getBoundingClientRect();
-          const testId = html.getAttribute("data-testid")?.toLowerCase() ?? "";
-          return {
-            hasArea: rect.width > 0 && rect.height > 0,
-            knownPill: html.matches("[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]")
-              || testId.includes("mention")
-              || testId.includes("connector")
-              || testId.includes("plugin"),
-          };
-        }).catch(() => undefined);
-        const names = state
-          ? await candidate.evaluate(connectorCandidateNames).catch(() => [] as string[])
-          : [];
-        if (state && chatGptConnectorSelectionMatches({ ...state, names, visible }, this.config.appName)) return true;
-      }
-    }
-
-    // Current ChatGPT Plugins shell can represent a committed connector as a
-    // label next to data-testid="plugins-button" instead of an inline mention
-    // under the contenteditable. The reported DOM is effectively:
-    //   Plugins | [icon "C"] Codex Native
-    //
-    // Scope this fallback to the smallest visible ancestor shared by the
-    // active composer and a nearby Plugins button. Popup/menu/floating rows are
-    // excluded so an uncommitted autocomplete result cannot authorize sending.
     return composer.evaluate((composerElement, appName) => {
       const composerHtml = composerElement as HTMLElement;
+      const normalizedExactName = (value: string): string =>
+        value.replace(/\s+/g, " ").trim().replace(/^@\s*/, "");
+      const exactTarget = normalizedExactName(appName);
       const normalizeName = (value: string): string =>
         value.replace(/\s+/g, " ").trim().replace(/^@\s*/, "").toLowerCase();
       const target = normalizeName(appName);
       const visibleElement = (value: HTMLElement): boolean => {
+        if (typeof value.checkVisibility === "function") {
+          return value.checkVisibility({
+            checkOpacity: true,
+            checkVisibilityCSS: true,
+            contentVisibilityAuto: true,
+          });
+        }
         const style = getComputedStyle(value);
         const rect = value.getBoundingClientRect();
         return style.display !== "none"
@@ -861,6 +1134,44 @@ export class ChatGptBrowserWorker {
           withoutDecoration.textContent ?? "",
         ].filter(Boolean);
       };
+
+      // Detect the common inline-pill representation in one renderer pass.
+      // The previous Playwright locator/count/isVisible/evaluate loop crossed
+      // the browser boundary repeatedly for each candidate, which made connector
+      // setup surprisingly CPU-heavy on low-core Windows machines.
+      const composerCandidateSelector = [
+        "[data-inline-selection-pill]",
+        "[data-inline-selection-pill-cursor-target]",
+        "[data-testid*='mention']",
+        "[data-testid*='connector']",
+        "[data-testid*='plugin']",
+        "a[role='link']",
+        "[contenteditable='false']",
+        "[aria-label]",
+        "[title]",
+      ].join(", ");
+      const candidates = new Set<HTMLElement>([
+        ...composerHtml.querySelectorAll<HTMLElement>(composerCandidateSelector),
+        ...document.querySelectorAll<HTMLElement>(
+          "[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]",
+        ),
+      ]);
+      for (const candidate of candidates) {
+        if (!visibleElement(candidate)) continue;
+        const rect = candidate.getBoundingClientRect();
+        const testId = candidate.getAttribute("data-testid")?.toLowerCase() ?? "";
+        const knownPill = candidate.matches("[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]")
+          || testId.includes("mention")
+          || testId.includes("connector")
+          || testId.includes("plugin");
+        if ((rect.width <= 0 || rect.height <= 0) && !knownPill) continue;
+        if (candidateNames(candidate).some(name => normalizedExactName(name) === exactTarget)) return true;
+      }
+
+      // Current ChatGPT Plugins shell can represent a committed connector as a
+      // label next to data-testid="plugins-button" instead of an inline mention
+      // under the contenteditable. Scope this fallback to the smallest visible
+      // ancestor shared by the active composer and a nearby Plugins button.
       const excludedSelector = [
         "[role='listbox']",
         "[role='menu']",
@@ -934,7 +1245,7 @@ export class ChatGptBrowserWorker {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (await this.connectorIsSelected(page, composer)) return true;
-      await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
+      await new Promise(resolveSleep => setTimeout(resolveSleep, activePollingProfile.uiMs));
     }
     return false;
   }
@@ -1090,7 +1401,7 @@ export class ChatGptBrowserWorker {
       if (await this.connectorIsSelected(page, composer)) return { selected: true };
       const candidate = await this.visibleConnectorSuggestion(page);
       if (candidate) return { suggestion: candidate };
-      await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
+      await new Promise(resolveSleep => setTimeout(resolveSleep, activePollingProfile.uiMs));
     }
     // Close the race where ChatGPT commits the plugin at the polling deadline.
     if (await this.connectorIsSelected(page, composer)) return { selected: true };
@@ -1264,7 +1575,7 @@ export class ChatGptBrowserWorker {
           if (await this.waitForConnectorSelected(page, composer, 1_500)) return true;
           break;
         }
-        await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
+        await new Promise(resolveSleep => setTimeout(resolveSleep, activePollingProfile.uiMs));
       }
 
       console.info(
@@ -1403,7 +1714,7 @@ export class ChatGptBrowserWorker {
           if (selected) return true;
         }
       }
-      await page.waitForTimeout(100);
+      await page.waitForTimeout(activePollingProfile.uiMs);
     }
     return this.connectorIsSelected(page, composer);
   }
@@ -1535,7 +1846,7 @@ export class ChatGptBrowserWorker {
     const deadline = Date.now() + 60_000;
     while (Date.now() < deadline) {
       if (await send.isEnabled().catch(() => false)) return;
-      await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
+      await new Promise(resolveSleep => setTimeout(resolveSleep, activePollingProfile.uiMs));
     }
     throw new Error("ChatGPT accepted the prompt attachments but did not make the message ready to send");
   }
@@ -1556,16 +1867,16 @@ export class ChatGptBrowserWorker {
     const assistantTurns = page.locator('section[data-testid^="conversation-turn-"][data-turn="assistant"]');
     const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" });
     const composerPresent = await composer.count().catch(() => 0) > 0;
-    const observedPrompt = composerPresent
-      ? await this.attachedPromptText(page).catch(() => undefined)
-      : undefined;
+    const composerHasUserText = composerPresent
+      ? await this.composerHasUserText(composer)
+      : true;
     return {
       initialUserTurns,
       initialAssistantTurns,
       userTurns: await userTurns.count().catch(() => initialUserTurns),
       assistantTurns: await assistantTurns.count().catch(() => initialAssistantTurns),
       running: await this.stopControl(page).isVisible().catch(() => false),
-      promptCleared: expectedPrompt.length > 0 && observedPrompt === "",
+      promptCleared: expectedPrompt.length > 0 && composerPresent && !composerHasUserText,
     };
   }
 
@@ -1579,7 +1890,7 @@ export class ChatGptBrowserWorker {
     const deadline = Date.now() + timeoutMs;
     let state = await this.submissionState(page, expectedPrompt, initialUserTurns, initialAssistantTurns);
     while (!chatGptSubmissionWasObserved(state) && Date.now() < deadline) {
-      await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
+      await new Promise(resolveSleep => setTimeout(resolveSleep, activePollingProfile.uiMs));
       state = await this.submissionState(page, expectedPrompt, initialUserTurns, initialAssistantTurns);
     }
     return state;
@@ -1604,7 +1915,7 @@ export class ChatGptBrowserWorker {
     const readyDeadline = Date.now() + 10_000;
     while (Date.now() < readyDeadline) {
       if (await send.isVisible().catch(() => false) && await send.isEnabled().catch(() => false)) break;
-      await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
+      await new Promise(resolveSleep => setTimeout(resolveSleep, activePollingProfile.uiMs));
     }
     if (!await send.isVisible().catch(() => false) || !await send.isEnabled().catch(() => false)) {
       throw new Error("ChatGPT composer preserved the prompt but its Send button did not become actionable");
@@ -1723,7 +2034,7 @@ export class ChatGptBrowserWorker {
         console.info("[chatgpt-web] ChatGPT delivery Retry was accepted; browser turn is active again");
         return true;
       }
-      await page.waitForTimeout(100);
+      await page.waitForTimeout(activePollingProfile.uiMs);
     }
 
     throw new Error("ChatGPT Retry did not clear the message delivery timeout state");
@@ -1743,10 +2054,21 @@ export class ChatGptBrowserWorker {
     return true;
   }
 
-  private async responseDomSnapshot(responseTurn: Locator): Promise<ChatGptResponseDomSnapshot> {
-    const snapshot = await responseTurn.evaluate(element => {
-      const root = element as HTMLElement;
+  private async responseDomSnapshot(
+    page: Page,
+    responseIndex: number,
+    scanRecoverySignals: boolean,
+    scanTraceBlocks: boolean,
+  ): Promise<ChatGptResponseDomSnapshot> {
+    const snapshot = await page.evaluate(({ maxTraceCandidates, responseIndex, scanRecoverySignals, scanTraceBlocks }) => {
       const visible = (candidate: HTMLElement): boolean => {
+        if (typeof candidate.checkVisibility === "function") {
+          return candidate.checkVisibility({
+            checkOpacity: true,
+            checkVisibilityCSS: true,
+            contentVisibilityAuto: true,
+          });
+        }
         const style = getComputedStyle(candidate);
         const rect = candidate.getBoundingClientRect();
         return style.display !== "none"
@@ -1755,66 +2077,160 @@ export class ChatGptBrowserWorker {
           && rect.width > 0
           && rect.height > 0;
       };
-
-      const rendered = [...root.querySelectorAll<HTMLElement>(".markdown")].at(-1);
-      const completionAction = [...root.querySelectorAll<HTMLElement>('button[aria-label="Copy response"]')]
-        .find(visible);
-      const completionActionVisible = completionAction !== undefined;
-      const candidates = new Map<HTMLElement, "markdown" | "status">();
-      root.querySelectorAll<HTMLElement>(".markdown").forEach(candidate => candidates.set(candidate, "markdown"));
-      root.querySelectorAll<HTMLElement>(
-        'button, [role="status"], [aria-busy="true"], [data-testid*="cot"], [data-testid*="reason"], [data-testid*="thought"]',
-      ).forEach(candidate => {
-        if (candidate.closest('[aria-label="Response actions"]')) return;
-        const semantic = candidate.closest<HTMLElement>("button") ?? candidate;
-        if (!candidates.has(semantic)) candidates.set(semantic, "status");
-      });
-      root.querySelectorAll<HTMLElement>("[data-streaming-response-status]").forEach(container => {
-        if (![...candidates.keys()].some(candidate => container.contains(candidate))) {
-          candidates.set(container, "status");
+      const stop = document.querySelector<HTMLElement>([
+        'button[data-testid="stop-button"]',
+        'button[aria-label="Stop answering"]',
+        'button[aria-label="Stop generating"]',
+      ].join(", "));
+      const running = Boolean(stop && visible(stop));
+      let deliveryTimeoutPresent = false;
+      let toolConfirmationPresent = false;
+      // Recovery states are rare and page-wide control scans are costly on long
+      // transcripts. Probe them less frequently than response progress.
+      if (scanRecoverySignals) {
+        for (const candidate of document.querySelectorAll<HTMLElement>("button, [role='alert'], [role='dialog'], [role='status']")) {
+          const text = (candidate.textContent || "").replace(/\s+/g, " ").trim();
+          if (!deliveryTimeoutPresent
+            && /Message delivery timed out\. Please try again\./i.test(text)
+            && visible(candidate)) {
+            deliveryTimeoutPresent = true;
+          }
+          if (!toolConfirmationPresent
+            && /Allow ChatGPT to use .+\?/i.test(text)
+            && visible(candidate)) {
+            toolConfirmationPresent = true;
+          }
+          if (deliveryTimeoutPresent && toolConfirmationPresent) break;
         }
-      });
-      const traceBlocks = [...candidates]
-        .filter(([candidate]) => visible(candidate))
-        .sort(([left], [right]) => left === right
-          ? 0
-          : left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1)
-        .map(([candidate, kind]) => ({
-          kind,
-          // The trailing Markdown root is the growing final answer. The trace
-          // tracker intentionally never emits it, so do not serialize its full
-          // text across the Playwright boundary every 250 ms. Keep an empty
-          // sentinel so tracker ordering/"last markdown" semantics stay exact.
-          text: candidate === rendered ? "" : (candidate.innerText ?? candidate.textContent ?? "").trim(),
-          finalAnswer: candidate === rendered,
-        }))
-        .filter(block => block.finalAnswer || block.text.length > 0)
-        .filter((block, index, blocks) => block.finalAnswer || (
-          blocks.findIndex(other => !other.finalAnswer && other.kind === block.kind && other.text === block.text) === index
-        ))
-        .map(({ kind, text }) => ({ kind, text }));
+      }
+
+      const root = document.querySelectorAll<HTMLElement>(
+        'section[data-testid^="conversation-turn-"][data-turn="assistant"]',
+      )[responseIndex];
+      if (!root) {
+        return {
+          responsePresent: false,
+          running,
+          deliveryTimeoutPresent,
+          toolConfirmationPresent,
+          completionSignature: "",
+          visibleText: "",
+          visibleTextLength: 0,
+          completionActionPresent: false,
+          traceBlocks: [],
+        };
+      }
+
+      let rendered: HTMLElement | undefined;
+      for (const candidate of root.querySelectorAll<HTMLElement>(".markdown")) rendered = candidate;
+      // ChatGPT may keep the response-actions row hidden until hover or move it
+      // behind responsive UI on smaller displays. DOM presence is the stable
+      // completion signal; requiring the Copy button to be visibly laid out can
+      // deadlock a finished turn on slower/smaller machines.
+      const completionActionPresent = root.querySelector<HTMLElement>([
+        'button[aria-label="Copy response"]',
+        'button[data-testid="copy-turn-action-button"]',
+      ].join(', ')) !== null;
+      let traceBlocks: ChatGptVisibleTraceBlock[] = [];
+      if (scanTraceBlocks) {
+        const candidates = new Map<HTMLElement, "markdown" | "status">();
+        const streamingContainers: HTMLElement[] = [];
+        // Trace extraction is intentionally decoupled from the correctness poll.
+        // Layout/visibility work is expensive on 2c/4t machines, while visible
+        // commentary does not need sub-second freshness. Most polls now stop
+        // after reading the tiny completion state above.
+        root.querySelectorAll<HTMLElement>([
+          ".markdown",
+          "button",
+          '[role="status"]',
+          '[aria-busy="true"]',
+          '[data-testid*="cot"]',
+          '[data-testid*="reason"]',
+          '[data-testid*="thought"]',
+          "[data-streaming-response-status]",
+        ].join(", ")).forEach(candidate => {
+          if (candidate.hasAttribute("data-streaming-response-status")) {
+            streamingContainers.push(candidate);
+            return;
+          }
+          if (candidate.matches(".markdown")) {
+            candidates.set(candidate, "markdown");
+            return;
+          }
+          if (candidate.closest('[aria-label="Response actions"]')) return;
+          const semantic = candidate.closest<HTMLElement>("button") ?? candidate;
+          if (!candidates.has(semantic)) candidates.set(semantic, "status");
+        });
+        for (const container of streamingContainers) {
+          let containsKnownCandidate = false;
+          for (const candidate of candidates.keys()) {
+            if (container.contains(candidate)) {
+              containsKnownCandidate = true;
+              break;
+            }
+          }
+          if (!containsKnownCandidate) candidates.set(container, "status");
+        }
+        traceBlocks = [...candidates]
+          // Long tool turns can accumulate hundreds of old trace controls. They
+          // were observed on earlier polls, so avoid re-running layout/innerText
+          // work across the entire historical DOM on every pass.
+          .slice(-maxTraceCandidates)
+          .filter(([candidate]) => visible(candidate))
+          .map(([candidate, kind]) => ({
+            kind,
+            // The trailing Markdown root is the growing final answer. The trace
+            // tracker intentionally never emits it, so do not serialize its full
+            // text across the Playwright boundary on every poll. Keep an empty
+            // sentinel so tracker ordering/"last markdown" semantics stay exact.
+            text: candidate === rendered ? "" : (candidate.textContent ?? "").trim(),
+            finalAnswer: candidate === rendered,
+          }))
+          .filter(block => block.finalAnswer || block.text.length > 0)
+          .filter((block, index, blocks) => block.finalAnswer || (
+            blocks.findIndex(other => !other.finalAnswer && other.kind === block.kind && other.text === block.text) === index
+          ))
+          .map(({ kind, text }) => ({ kind, text }));
+      }
       // Final-answer text/HTML is large and grows monotonically. It is only
       // consumed once the response action is present, so defer all three large
       // DOM serializations until that condition holds. This removes the main
       // O(response-size × poll-count) IPC/GC cost on long requests.
-      const visibleText = completionActionVisible
-        ? (rendered?.innerText ?? rendered?.textContent ?? "").trim()
+      const completionText = completionActionPresent ? (rendered?.textContent ?? "").trim() : "";
+      const completionSignature = completionText
+        ? `${completionText.length}:${completionText.slice(0, 96)}:${completionText.slice(-192)}`
         : "";
-      const renderedChildren = completionActionVisible && rendered ? [...rendered.children] : [];
+      const visibleText = completionText.length <= 512 ? completionText : "";
       return {
         responsePresent: true,
+        running,
+        deliveryTimeoutPresent,
+        toolConfirmationPresent,
+        completionSignature,
         visibleText,
-        visibleTextLength: visibleText.length,
-        fullHtml: completionActionVisible ? rendered?.innerHTML ?? "" : "",
-        stableHtml: completionActionVisible
-          ? renderedChildren.slice(0, -1).map(child => child.outerHTML).join("")
-          : "",
-        completionActionVisible,
+        visibleTextLength: completionText.length,
+        completionActionPresent,
         traceBlocks,
       };
-    }, undefined, { timeout: 2_000 }).catch(() => absentResponseDomSnapshot());
+    }, {
+      maxTraceCandidates: MAX_CHATGPT_TRACE_CANDIDATES,
+      responseIndex,
+      scanRecoverySignals,
+      scanTraceBlocks,
+    }).catch(() => absentResponseDomSnapshot());
     snapshot.traceBlocks = snapshot.traceBlocks.filter(block => !isChatGptTraceControl(block));
     return snapshot;
+  }
+
+  private async finalResponseHtml(page: Page, responseIndex: number): Promise<string> {
+    return page.evaluate(responseIndex => {
+      const root = document.querySelectorAll<HTMLElement>(
+        'section[data-testid^="conversation-turn-"][data-turn="assistant"]',
+      )[responseIndex];
+      if (!root) return "";
+      const markdown = root.querySelectorAll<HTMLElement>(".markdown");
+      return markdown.length > 0 ? markdown[markdown.length - 1]!.innerHTML : "";
+    }, responseIndex).catch(() => "");
   }
 
   private async stalledTurnDiagnostic(page: Page, responseTurn: Locator): Promise<string> {
@@ -1865,6 +2281,7 @@ export class ChatGptBrowserWorker {
   private async runExclusive(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     const prepared = await turn.prepare();
+    let rendererTelemetry: ChatGptRendererTelemetry | undefined;
     try {
       if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       const estimatedInputTokens = estimateCompiledChatGptWebInputTokens(prepared, turn.modelId);
@@ -1879,6 +2296,7 @@ export class ChatGptBrowserWorker {
       await this.runStage(turn.traceId, "chat_surface_selection", browserStageTimeouts.navigation, () => (
         this.ensureRegularChatSurface(page)
       ));
+      await this.applyLowPowerPageStyle(page);
       const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" });
       try {
         await this.runStage(turn.traceId, "composer_ready", browserStageTimeouts.composerReady, () => (
@@ -1895,6 +2313,9 @@ export class ChatGptBrowserWorker {
         this.selectModelAndEffort(page, turn.modelId, turn.reasoning, turn.capabilities)
       ));
       if (mode.localTools) {
+        if (chatGptRendererTelemetryEnabled()) {
+          rendererTelemetry = new ChatGptRendererTelemetry(page, turn.traceId);
+        }
         deadline = Date.now() + Math.max(
           this.config.turnTimeoutMs,
           DEFAULT_CHATGPT_TOOL_TURN_TIMEOUT_MS,
@@ -1934,11 +2355,21 @@ export class ChatGptBrowserWorker {
       let visibleTrace = new ChatGptVisibleTraceTracker();
       let markdownStream = new ChatGptMarkdownStream(stripChatGptTransportMarkers);
       let completionTracker = new ChatGptCompletionTracker();
+      let previousPendingToolCount = 0;
+      let nextRecoverySignalScanAt = 0;
+      let nextTraceScanAt = 0;
       let domHealthTracker = new ChatGptTurnDomHealthTracker(
         CHATGPT_RESPONSE_DOM_GRACE_MS,
         CHATGPT_EMPTY_RESPONSE_GRACE_MS,
         mode.localTools,
       );
+      const waitForActivity = async (pendingToolCount: number, timeoutMs: number): Promise<void> => {
+        if (mode.localTools && turn.waitForPendingToolCountChange) {
+          await turn.waitForPendingToolCountChange(pendingToolCount, timeoutMs);
+          return;
+        }
+        await new Promise(resolveSleep => setTimeout(resolveSleep, timeoutMs));
+      };
       for (;;) {
         if (turn.abortSignal?.aborted) {
           const stop = page.getByRole("button", { name: "Stop answering" });
@@ -1946,7 +2377,52 @@ export class ChatGptBrowserWorker {
           throw new DOMException("ChatGPT web turn aborted", "AbortError");
         }
 
+        if (Date.now() >= deadline) {
+          throw new Error("ChatGPT web tool turn exceeded its absolute browser lifetime");
+        }
+        if (Date.now() - lastHeartbeat >= 10_000) {
+          turn.onHeartbeat?.();
+          lastHeartbeat = Date.now();
+        }
+
+        const pendingToolCount = mode.localTools
+          ? Math.max(0, turn.pendingToolCount?.() ?? 0)
+          : 0;
+        if (pendingToolCount > 0) {
+          await rendererTelemetry?.sample(
+            previousPendingToolCount > 0 ? "tool-wait" : "tool-wait-start",
+            pendingToolCount,
+            previousPendingToolCount === 0,
+          );
+          previousPendingToolCount = pendingToolCount;
+          // ChatGPT cannot make substantive progress until these local results
+          // arrive. Avoid the expensive trace/layout snapshot entirely while
+          // blocked. The broker wakes us immediately when the count changes;
+          // the long timeout is only a fallback for old/non-evented runtimes.
+          await waitForActivity(
+            pendingToolCount,
+            chatGptResponsePollInterval(pendingToolCount, activePollingProfile.responseMs),
+          );
+          continue;
+        }
+        if (previousPendingToolCount > 0) {
+          await rendererTelemetry?.sample("tool-wait-end", 0, true);
+          previousPendingToolCount = 0;
+        }
+
+        const now = Date.now();
+        const scanRecoverySignals = now >= nextRecoverySignalScanAt;
+        if (scanRecoverySignals) nextRecoverySignalScanAt = now + activePollingProfile.recoveryMs;
+        const scanTraceBlocks = now >= nextTraceScanAt;
+        if (scanTraceBlocks) nextTraceScanAt = now + activePollingProfile.traceMs;
+        const snapshot = await this.responseDomSnapshot(
+          page,
+          initialResponseTurnCount,
+          scanRecoverySignals,
+          scanTraceBlocks,
+        );
         if (mode.localTools
+          && snapshot.deliveryTimeoutPresent
           && await this.recoverMessageDeliveryTimeout(page, deliveryTimeoutRecoveries)) {
           deliveryTimeoutRecoveries += 1;
           finalText = "";
@@ -1962,56 +2438,40 @@ export class ChatGptBrowserWorker {
             CHATGPT_EMPTY_RESPONSE_GRACE_MS,
             true,
           );
-          await page.waitForTimeout(250);
+          await waitForActivity(0, activePollingProfile.responseMs);
+          continue;
+        }
+        if (mode.localTools && snapshot.toolConfirmationPresent && await this.handleToolConfirmation(page)) {
+          await waitForActivity(0, activePollingProfile.responseMs);
           continue;
         }
 
-        if (Date.now() >= deadline) {
-          throw new Error("ChatGPT web tool turn exceeded its absolute browser lifetime");
-        }
-        if (Date.now() - lastHeartbeat >= 10_000) {
-          turn.onHeartbeat?.();
-          lastHeartbeat = Date.now();
-        }
-
-        if (mode.localTools && await this.handleToolConfirmation(page)) {
-          await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
-          continue;
-        }
-
-        const snapshot = await this.responseDomSnapshot(responseTurn);
-        const stop = page.getByRole("button", { name: "Stop answering" });
-        const running = await stop.isVisible().catch(() => false);
+        const running = snapshot.running;
         if (running) sawRunning = true;
         if (snapshot.responsePresent) {
-          for (const trace of visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible)) {
+          for (const trace of visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionPresent)) {
             if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
             else turn.onReasoningSummary?.(trace.text);
           }
           const domError = domHealthTracker.update({
             responsePresent: snapshot.responsePresent,
             running,
-            currentText: snapshot.visibleText,
-            completionActionVisible: snapshot.completionActionVisible,
+            currentText: snapshot.visibleTextLength > 0 ? "present" : "",
+            completionActionPresent: snapshot.completionActionPresent,
           });
           if (domError) throw new Error(domError);
-          // ChatGPT can render visible commentary Markdown between tool-status rows. Only a
-          // Markdown root accompanied by the response action belongs to the final answer stream.
-          if (snapshot.completionActionVisible) {
-            const stableDelta = markdownStream.observeStableHtml(snapshot.stableHtml);
-            if (stableDelta) turn.onTextDelta(stableDelta);
-          }
           if (completionTracker.update({
             responsePresent: snapshot.responsePresent,
             running,
-            currentText: snapshot.visibleText,
-            completionActionVisible: snapshot.completionActionVisible,
+            currentText: snapshot.completionSignature,
+            completionActionPresent: snapshot.completionActionPresent,
           })) {
             if (snapshot.visibleText === "api_tool unavailable") {
               throw new Error("ChatGPT selected mode rejected the Codex Native MCP tool (api_tool unavailable)");
             }
-            const final = markdownStream.finish(snapshot.fullHtml);
-            if (!final.markdown && snapshot.visibleText) {
+            const finalHtml = await this.finalResponseHtml(page, initialResponseTurnCount);
+            const final = markdownStream.finish(finalHtml);
+            if (!final.markdown && snapshot.visibleTextLength > 0) {
               throw new Error("ChatGPT completed with visible text that could not be serialized as Markdown");
             }
             if (final.delta) turn.onTextDelta(final.delta);
@@ -2024,7 +2484,7 @@ export class ChatGptBrowserWorker {
               diagnosticError: error instanceof Error ? error.message : String(error),
             }));
             console.warn(
-              `[chatgpt-web] waiting for completed-turn evidence (running=${running}, sawRunning=${sawRunning}, textChars=${snapshot.visibleTextLength}, completionActionVisible=${snapshot.completionActionVisible}, ui=${diagnostic})`,
+              `[chatgpt-web] waiting for completed-turn evidence (running=${running}, sawRunning=${sawRunning}, textChars=${snapshot.visibleTextLength}, completionActionPresent=${snapshot.completionActionPresent}, ui=${diagnostic})`,
             );
           }
         } else {
@@ -2032,7 +2492,7 @@ export class ChatGptBrowserWorker {
             responsePresent: false,
             running,
             currentText: "",
-            completionActionVisible: false,
+            completionActionPresent: false,
           });
           if (domError) throw new Error(domError);
 
@@ -2047,16 +2507,27 @@ export class ChatGptBrowserWorker {
             );
           }
         }
-        await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+        const nextPendingToolCount = mode.localTools
+          ? Math.max(0, turn.pendingToolCount?.() ?? 0)
+          : 0;
+        await waitForActivity(
+          nextPendingToolCount,
+          chatGptResponsePollInterval(nextPendingToolCount, activePollingProfile.responseMs),
+        );
       }
 
       if (this.context) {
         const state = await this.context.storageState();
-        atomicWriteFile(this.config.storageStatePath, `${JSON.stringify(state)}\n`);
+        const stateJson = `${JSON.stringify(state)}\n`;
+        if (stateJson !== this.lastStorageStateJson) {
+          atomicWriteFile(this.config.storageStatePath, stateJson);
+          this.lastStorageStateJson = stateJson;
+        }
       }
       console.info(`[chatgpt-web] browser turn ${turn.traceId} completed (markdownChars=${finalText.length})`);
       return finalText;
     } finally {
+      await rendererTelemetry?.close();
       prepared.release();
     }
   }
@@ -2066,4 +2537,7 @@ export async function closeChatGptBrowserWorkers(): Promise<void> {
   const active = [...new Set(workers.values())];
   workers.clear();
   await Promise.all(active.map(worker => worker.close()));
+  const browsers = [...new Set(sharedBrowsers.values())];
+  sharedBrowsers.clear();
+  await Promise.all(browsers.map(browser => browser.close()));
 }

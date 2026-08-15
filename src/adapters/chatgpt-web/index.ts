@@ -377,6 +377,10 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       onReasoningSummary: text => trace.push({ kind: "reasoning", text }),
       onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
       onTextDelta: delta => text.push(delta),
+      pendingToolCount: () => activeToken ? broker.pendingToolCount(activeToken) : 0,
+      waitForPendingToolCountChange: (previousCount, timeoutMs) => activeToken
+        ? broker.waitForPendingToolCountChange(activeToken, previousCount, timeoutMs, browserAbort.signal)
+        : Promise.resolve(0),
     });
     void browser.catch(error => {
       if (!tokenSettled) {

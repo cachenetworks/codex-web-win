@@ -37,6 +37,15 @@ interface ToolWaiter {
   onAbort?: () => void;
 }
 
+interface PendingCountWaiter {
+  previousCount: number;
+  resolve: (count: number) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+}
+
 interface TurnChannel {
   traceId: string;
   environment: PendingTurn;
@@ -44,6 +53,7 @@ interface TurnChannel {
   queuedCallIds: string[];
   invocations: Map<string, PendingInvocation>;
   waiters: Set<ToolWaiter>;
+  pendingCountWaiters: Set<PendingCountWaiter>;
   batchTimer?: ReturnType<typeof setTimeout>;
 }
 
@@ -116,6 +126,7 @@ export class TurnBroker {
       queuedCallIds: [],
       invocations: new Map(),
       waiters: new Set(),
+      pendingCountWaiters: new Set(),
     };
     this.channels.set(token, channel);
     this.pending.set(token, channel);
@@ -130,6 +141,48 @@ export class TurnBroker {
       throw new Error("Codex turn environment changed during an active ChatGPT tool loop");
     }
     channel.environment = { ...environment, expiresAt: channel.environment.expiresAt };
+  }
+
+  pendingToolCount(token: string): number {
+    this.prune();
+    return this.channels.get(token)?.invocations.size ?? 0;
+  }
+
+  async waitForPendingToolCountChange(
+    token: string,
+    previousCount: number,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<number> {
+    this.prune();
+    const channel = this.channels.get(token);
+    if (!channel) throw new Error("turn token is invalid or expired");
+    const current = channel.invocations.size;
+    if (current !== previousCount || timeoutMs <= 0) return current;
+    if (signal?.aborted) throw new DOMException("pending tool count wait aborted", "AbortError");
+    return new Promise<number>((resolveWait, rejectWait) => {
+      const finish = (value: number, error?: Error) => {
+        channel.pendingCountWaiters.delete(waiter);
+        clearTimeout(waiter.timer);
+        if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+        if (error) rejectWait(error);
+        else resolveWait(value);
+      };
+      const waiter: PendingCountWaiter = {
+        previousCount,
+        resolve: value => finish(value),
+        reject: error => finish(channel.invocations.size, error),
+        timer: setTimeout(() => finish(channel.invocations.size), timeoutMs),
+        ...(signal ? { signal } : {}),
+      };
+      if (signal) {
+        waiter.onAbort = () => finish(channel.invocations.size, new DOMException("pending tool count wait aborted", "AbortError"));
+        signal.addEventListener("abort", waiter.onAbort, { once: true });
+      }
+      channel.pendingCountWaiters.add(waiter);
+      const afterRegistration = channel.invocations.size;
+      if (afterRegistration !== previousCount) finish(afterRegistration);
+    });
   }
 
   async nextToolBatch(token: string, signal?: AbortSignal): Promise<BrokerToolRequest[]> {
@@ -160,6 +213,7 @@ export class TurnBroker {
     if (!invocation) throw new Error(`tool call is not pending: ${callId}`);
     if (channel.queuedCallIds.includes(callId)) throw new Error(`tool call was completed before it was delivered: ${callId}`);
     channel.invocations.delete(callId);
+    this.wakePendingCountWaiters(channel);
     console.info(`[chatgpt-web] broker trace=${channel.traceId} completed call=${callId.slice(0, 17)} pending=${channel.invocations.size}`);
     invocation.resolve(result);
   }
@@ -328,6 +382,7 @@ export class TurnBroker {
     return new Promise<BrokerToolResult>((resolveInvoke, rejectInvoke) => {
       binding.channel.invocations.set(callId, { request: toolRequest, resolve: resolveInvoke, reject: rejectInvoke });
       binding.channel.queuedCallIds.push(callId);
+      this.wakePendingCountWaiters(binding.channel);
       console.info(
         `[chatgpt-web] broker trace=${binding.channel.traceId} queued call=${callId.slice(0, 17)} tool=${wireName} waiters=${binding.channel.waiters.size}`,
       );
@@ -368,6 +423,13 @@ export class TurnBroker {
     }
   }
 
+  private wakePendingCountWaiters(channel: TurnChannel): void {
+    const count = channel.invocations.size;
+    for (const waiter of [...channel.pendingCountWaiters]) {
+      if (waiter.previousCount !== count) waiter.resolve(count);
+    }
+  }
+
   private rejectChannel(channel: TurnChannel, error: Error): void {
     if (channel.batchTimer) clearTimeout(channel.batchTimer);
     channel.batchTimer = undefined;
@@ -378,6 +440,8 @@ export class TurnBroker {
     channel.waiters.clear();
     for (const invocation of channel.invocations.values()) invocation.reject(error);
     channel.invocations.clear();
+    for (const waiter of [...channel.pendingCountWaiters]) waiter.reject(error);
+    channel.pendingCountWaiters.clear();
     channel.queuedCallIds = [];
   }
 

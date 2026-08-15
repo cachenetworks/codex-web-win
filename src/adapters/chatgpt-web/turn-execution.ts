@@ -25,7 +25,7 @@ interface TraceWaiter {
 }
 
 export class ChatGptTraceFeed {
-  private readonly queued: ChatGptTraceEvent[] = [];
+  private queued: ChatGptTraceEvent[] = [];
   private readonly waiters = new Set<TraceWaiter>();
 
   push(event: ChatGptTraceEvent): void {
@@ -41,7 +41,9 @@ export class ChatGptTraceFeed {
   }
 
   drain(): ChatGptTraceEvent[] {
-    return this.queued.splice(0);
+    const queued = this.queued;
+    this.queued = [];
+    return queued;
   }
 
   wait(signal?: AbortSignal): Promise<void> {
@@ -78,7 +80,7 @@ interface TextWaiter {
 
 /** Append-only browser Markdown feed. Waiters are notifications; `drain` owns consumption. */
 export class ChatGptTextFeed {
-  private readonly queued: string[] = [];
+  private queued: string[] = [];
   private readonly waiters = new Set<TextWaiter>();
   private readonly textChunks: string[] = [];
   private cachedText?: string;
@@ -100,7 +102,9 @@ export class ChatGptTextFeed {
   }
 
   drain(): string[] {
-    return this.queued.splice(0);
+    const queued = this.queued;
+    this.queued = [];
+    return queued;
   }
 
   value(): string {

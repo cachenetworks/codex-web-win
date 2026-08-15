@@ -4,7 +4,7 @@ import { atomicWriteFile, getConfigDir } from "../config";
 
 const MAX_STORED_RESPONSES = 1_000;
 const RESPONSE_TTL_MS = 60 * 60 * 1_000;
-const SNAPSHOT_DEBOUNCE_MS = 2_000;
+const SNAPSHOT_DEBOUNCE_MS = 5_000;
 /** In-memory high-water byte cap across all entries. Forced store:false continuation chains
  * store the full expanded input each turn — ~quadratic bytes per chain —
  * so a count cap alone cannot bound memory. Oldest-first eviction applies past this mark. */
@@ -12,7 +12,7 @@ const MAX_STORED_RESPONSE_BYTES = 64 * 1024 * 1024;
 /** Entries whose serialized size exceeds this are kept in memory but skipped on disk: inputs can
  * carry base64 `input_image` data URLs, and one screenshot-heavy thread must not balloon the file. */
 const SNAPSHOT_ENTRY_MAX_BYTES = 2 * 1024 * 1024;
-const SNAPSHOT_TOTAL_MAX_BYTES = 24 * 1024 * 1024;
+export const RESPONSE_STATE_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;
 
 interface StoredResponseState {
   createdAt: number;
@@ -58,6 +58,19 @@ function setEntry(id: string, entry: Omit<StoredResponseState, "sizeBytes">): vo
   states.set(id, measured);
 }
 
+/**
+ * Disk snapshots are already globally bounded, so reload can use a conservative
+ * share of the snapshot's serialized size instead of JSON-stringifying every
+ * restored `items` array on the startup/request path. New entries still use the
+ * exact local measurement above.
+ */
+function setLoadedEntry(id: string, entry: Omit<StoredResponseState, "sizeBytes">, sizeBytes: number): void {
+  deleteEntry(id);
+  const measured = { ...entry, sizeBytes: Math.max(1, sizeBytes) };
+  storedResponseBytes += measured.sizeBytes;
+  states.set(id, measured);
+}
+
 /** The ONLY deletion point: TTL, count, byte, and explicit deletes all route here. */
 function deleteEntry(id: string): void {
   const existing = states.get(id);
@@ -95,21 +108,34 @@ function ensureLoaded(): void {
   try {
     const path = snapshotPath();
     if (!existsSync(path)) return;
-    const raw = JSON.parse(readFileSync(path, "utf-8")) as { version?: unknown; states?: unknown };
+    const snapshot = readFileSync(path, "utf-8");
+    const raw = JSON.parse(snapshot) as { version?: unknown; states?: unknown };
     if (raw.version !== 1 || !Array.isArray(raw.states)) return;
+    const validEntries: Array<[string, StoredResponseState]> = [];
     for (const entry of raw.states) {
       if (!Array.isArray(entry) || entry.length !== 2) continue;
       const [id, state] = entry as [unknown, unknown];
       if (typeof id !== "string" || !state || typeof state !== "object") continue;
       const rec = state as StoredResponseState;
       if (typeof rec.createdAt !== "number" || !Array.isArray(rec.items)) continue;
-      // Recompute sizes locally while loading; persisted sizeBytes is never trusted.
-      setEntry(id, {
+      validEntries.push([id, rec]);
+    }
+    // The snapshot contains only these entries plus small JSON framing. Dividing
+    // its full serialized size across them intentionally over-counts payload
+    // bytes slightly while avoiding an O(snapshot bytes) second stringify pass.
+    const loadedEntryBytes = validEntries.length > 0
+      ? Math.ceil(snapshot.length / validEntries.length)
+      : 0;
+    for (const [id, rec] of validEntries) {
+      setLoadedEntry(id, {
         createdAt: rec.createdAt,
         items: rec.items,
-      });
+      }, loadedEntryBytes);
     }
     pruneResponses();
+    // Older releases allowed a ~24 MiB restart cache. Migrate it lazily after
+    // loading so the next launch pays only for the new compact snapshot.
+    if (snapshot.length > RESPONSE_STATE_SNAPSHOT_MAX_BYTES + 1_024) schedulePersist();
   } catch {
     /* missing/corrupt snapshot: start empty */
   }
@@ -122,7 +148,7 @@ function persistNow(path: string): void {
   }
   pendingPersistPath = null;
   try {
-    const entries: [string, StoredResponseState][] = [];
+    const entries: string[] = [];
     let total = 0;
     // Newest-first so the most recent chains survive both caps.
     for (const entry of [...states].reverse()) {
@@ -130,18 +156,21 @@ function persistNow(path: string): void {
       const [id, state] = entry;
       const { sizeBytes: _sizeBytes, ...persistable } = state;
       const persistEntry: [string, StoredResponseState] = [id, persistable];
-      const size = JSON.stringify(persistEntry).length;
+      const serialized = JSON.stringify(persistEntry);
+      const size = serialized.length;
       if (size > SNAPSHOT_ENTRY_MAX_BYTES) continue;
-      if (total + size > SNAPSHOT_TOTAL_MAX_BYTES) break;
+      if (total + size > RESPONSE_STATE_SNAPSHOT_MAX_BYTES) break;
       total += size;
-      entries.push(persistEntry);
+      entries.push(serialized);
     }
     entries.reverse();
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     // mkdirSync's mode only applies on creation — re-harden an existing config dir so the
     // conversation-content snapshot never lands in a group/world-readable directory.
     try { chmodSync(dirname(path), 0o700); } catch { /* best-effort (e.g. Windows) */ }
-    atomicWriteFile(path, JSON.stringify({ version: 1, states: entries }));
+    // Reuse the serialized entries above instead of walking/stringifying the
+    // entire multi-megabyte cache a second time on the main event loop.
+    atomicWriteFile(path, `{"version":1,"states":[${entries.join(",")}]}`);
   } catch {
     /* best-effort: disk trouble must never affect request handling */
   }

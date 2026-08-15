@@ -3,11 +3,23 @@ import type { Locator, Page } from "playwright-core";
 export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true&surface=chat";
 
 async function anyVisible(locator: Locator): Promise<boolean> {
-  const count = await locator.count();
-  for (let index = 0; index < count; index += 1) {
-    if (await locator.nth(index).isVisible().catch(() => false)) return true;
-  }
-  return false;
+  return locator.evaluateAll(elements => elements.some(element => {
+    const candidate = element as HTMLElement;
+    if (typeof candidate.checkVisibility === "function") {
+      return candidate.checkVisibility({
+        checkOpacity: true,
+        checkVisibilityCSS: true,
+        contentVisibilityAuto: true,
+      });
+    }
+    const style = getComputedStyle(candidate);
+    const rect = candidate.getBoundingClientRect();
+    return style.display !== "none"
+      && style.visibility !== "hidden"
+      && style.opacity !== "0"
+      && rect.width > 0
+      && rect.height > 0;
+  })).catch(() => false);
 }
 
 export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> {
