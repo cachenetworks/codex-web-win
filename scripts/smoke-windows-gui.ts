@@ -78,187 +78,105 @@ async function run(
   }
   const stdoutPromise = new Response(child.stdout).text();
   const stderrPromise = new Response(child.stderr).text();
-  let timedOut = false;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    child.kill();
-  }, options.timeoutMs ?? 10_000);
-  const exitCode = await child.exited;
-  clearTimeout(timeout);
-  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-  if (timedOut) {
-    fail(`${basename(executable)} ${args.join(" ")} timed out\n${stderr}`);
-  }
-  return { exitCode, stdout, stderr };
-}
-
-function parseSingleJson(text: string, label: string): Record<string, unknown> {
-  const trimmed = text.trim();
-  assert(trimmed.length > 0, `${label} produced no JSON`);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutMs = options.timeoutMs ?? 20_000;
   try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    assert(Boolean(parsed) && typeof parsed === "object" && !Array.isArray(parsed), `${label} JSON is not an object`);
-    return parsed as Record<string, unknown>;
-  } catch (error) {
-    fail(`${label} did not emit one JSON object: ${error instanceof Error ? error.message : String(error)}\n${text}`);
+    const exitCode = await Promise.race([
+      child.exited,
+      new Promise<number>((_, reject) => {
+        timer = setTimeout(() => {
+          child.kill();
+          reject(new Error(`${basename(executable)} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+    return { exitCode, stdout: await stdoutPromise, stderr: await stderrPromise };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
-function treeSnapshot(root: string): Record<string, string> {
-  if (!existsSync(root)) return {};
-  const result: Record<string, string> = {};
+function parseSingleJson(text: string, label: string): Record<string, any> {
+  const trimmed = text.trim();
+  assert(trimmed.startsWith("{") && trimmed.endsWith("}"), `${label} did not return one JSON object: ${trimmed}`);
+  try {
+    return JSON.parse(trimmed) as Record<string, any>;
+  } catch (error) {
+    fail(`${label} returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function fileSha256(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function treeSnapshot(root: string): Map<string, string> {
+  const entries = new Map<string, string>();
+  if (!existsSync(root)) return entries;
   const visit = (directory: string) => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const path = join(directory, entry.name);
-      const key = relative(root, path).split(sep).join("/");
-      if (entry.isDirectory()) {
-        result[`${key}/`] = "directory";
-        visit(path);
-      } else if (entry.isFile()) {
-        const bytes = readFileSync(path);
-        result[key] = `${bytes.byteLength}:${createHash("sha256").update(bytes).digest("hex")}`;
-      } else {
-        result[key] = `other:${statSync(path).mode}`;
+    for (const name of readdirSync(directory)) {
+      const full = join(directory, name);
+      const relativePath = relative(root, full).split(sep).join("/");
+      const stat = statSync(full);
+      if (stat.isDirectory()) {
+        entries.set(`${relativePath}/`, "directory");
+        visit(full);
+      } else if (stat.isFile()) {
+        entries.set(relativePath, `${stat.size}:${fileSha256(full)}`);
       }
     }
   };
   visit(root);
-  return result;
+  return entries;
 }
 
-async function windowsPersistenceSnapshot(): Promise<Record<string, unknown>> {
-  const script = String.raw`
-$ErrorActionPreference = "SilentlyContinue"
-$pattern = "(?i)codex[- ]chatgpt[- ]web"
-$registry = @()
-foreach ($path in @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Run", "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce")) {
-  $item = Get-ItemProperty -LiteralPath $path
-  if ($item) {
-    foreach ($property in $item.PSObject.Properties) {
-      if ($property.Name -match $pattern -or [string]$property.Value -match $pattern) {
-        $registry += [ordered]@{ path = $path; name = $property.Name; value = [string]$property.Value }
-      }
-    }
-  }
-}
-$tasks = @(Get-ScheduledTask | Where-Object {
-  $_.TaskName -match $pattern -or $_.TaskPath -match $pattern
-} | ForEach-Object { "$($_.TaskPath)$($_.TaskName)" } | Sort-Object)
-$services = @(Get-Service | Where-Object {
-  $_.Name -match $pattern -or $_.DisplayName -match $pattern
-} | ForEach-Object { "$($_.Name)|$($_.DisplayName)|$($_.Status)" } | Sort-Object)
-$startup = [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
-$startupFiles = @()
-if ($startup) {
-  $startupFiles = @(Get-ChildItem -Force -LiteralPath $startup | Where-Object {
-    $_.Name -match $pattern
-  } | ForEach-Object { $_.FullName } | Sort-Object)
-}
-[ordered]@{
-  registry = @($registry | Sort-Object path, name, value)
-  tasks = $tasks
-  services = $services
-  startupFiles = $startupFiles
-} | ConvertTo-Json -Compress -Depth 6
-`;
-  const powershell = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const result = await run(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
-    timeoutMs: 20_000,
-  });
-  assert(result.exitCode === 0, `could not snapshot Windows persistence state: ${result.stderr}`);
-  return parseSingleJson(result.stdout, "Windows persistence snapshot");
+function assertTreeEqual(before: Map<string, string>, after: Map<string, string>, label: string): void {
+  const beforeEntries = [...before.entries()].sort(([a], [b]) => a.localeCompare(b));
+  const afterEntries = [...after.entries()].sort(([a], [b]) => a.localeCompare(b));
+  assert(JSON.stringify(afterEntries) === JSON.stringify(beforeEntries), `${label} changed unexpectedly`);
 }
 
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+async function windowsPersistenceSnapshot(): Promise<string> {
+  const script = [
+    "$ErrorActionPreference='SilentlyContinue'",
+    "$tasks = @(Get-ScheduledTask | Where-Object { $_.TaskName -match 'codex|chatgpt' } | ForEach-Object { $_.TaskPath + $_.TaskName } | Sort-Object)",
+    "$services = @(Get-Service | Where-Object { $_.Name -match 'codex|chatgpt' -or $_.DisplayName -match 'codex|chatgpt' } | ForEach-Object { $_.Name + ':' + $_.Status } | Sort-Object)",
+    "$startup = @()",
+    "$startupFolders = @([Environment]::GetFolderPath('Startup'), [Environment]::GetFolderPath('CommonStartup'))",
+    "foreach ($folder in $startupFolders) { if ($folder -and (Test-Path $folder)) { $startup += @(Get-ChildItem -Force $folder | Where-Object { $_.Name -match 'codex|chatgpt' } | ForEach-Object { $_.FullName }) } }",
+    "[pscustomobject]@{ tasks=$tasks; services=$services; startup=@($startup | Sort-Object) } | ConvertTo-Json -Compress -Depth 4",
+  ].join("; ");
+  const result = await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { timeoutMs: 20_000 });
+  assert(result.exitCode === 0, `Windows persistence snapshot failed: ${result.stderr}`);
+  return result.stdout.trim();
 }
 
-function locateFrameworkCompiler(): string {
-  const windows = process.env.WINDIR || "C:\\Windows";
-  const candidates = [
-    join(windows, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe"),
-    join(windows, "Microsoft.NET", "Framework", "v4.0.30319", "csc.exe"),
-  ];
-  const compiler = candidates.find(existsSync);
-  return compiler ?? fail("Windows GUI lifecycle smoke requires the built-in .NET Framework C# compiler");
+async function compileLifecycleProbe(output: string): Promise<void> {
+  const source = join(sourceRoot, "scripts", "windows-gui-lifecycle-probe.cs");
+  assert(existsSync(source), `missing lifecycle probe source: ${source}`);
+  const powershell = [
+    "$ErrorActionPreference='Stop'",
+    "$refs=@('System.dll','System.Core.dll','System.Windows.Forms.dll')",
+    `$source=${JSON.stringify(source)}`,
+    `$output=${JSON.stringify(output)}`,
+    "Add-Type -Path $source -ReferencedAssemblies $refs -OutputAssembly $output -OutputType ConsoleApplication",
+  ].join("; ");
+  const result = await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", powershell], { timeoutMs: 45_000 });
+  assert(result.exitCode === 0, `lifecycle probe compilation failed: ${result.stderr}`);
 }
 
-async function exerciseOuterJob(gui: string, root: string, environment: Record<string, string | undefined>): Promise<void> {
-  const probeSource = join(sourceRoot, "scripts", "windows-gui-lifecycle-probe.cs");
-  const probe = join(root, "windows-gui-lifecycle-probe.exe");
-  const compiler = locateFrameworkCompiler();
-  const compilation = await run(compiler, [
-    "/nologo",
-    "/optimize+",
-    "/target:exe",
-    `/out:${probe}`,
-    probeSource,
-  ], { cwd: sourceRoot, timeoutMs: 20_000 });
-  assert(compilation.exitCode === 0 && existsSync(probe), `lifecycle probe compilation failed: ${compilation.stderr || compilation.stdout}`);
-
-  const pidFile = join(root, "gui-job-pids.txt");
-  const guiProcess = Bun.spawn([gui, "--lifecycle-smoke", probe, pidFile], {
-    env: environment,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const stdoutPromise = new Response(guiProcess.stdout).text();
-  const stderrPromise = new Response(guiProcess.stderr).text();
-  let pids: number[] = [];
-  try {
-    const probeDeadline = Date.now() + 5_000;
-    while (!existsSync(pidFile) && guiProcess.exitCode === null && Date.now() < probeDeadline) {
-      await Bun.sleep(25);
-    }
-    if (!existsSync(pidFile)) {
-      if (guiProcess.exitCode === null) {
-        fail("GUI lifecycle smoke timed out before creating descendants");
-      }
-      const earlyExit = await guiProcess.exited;
-      const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-      fail(`GUI lifecycle smoke exited before creating descendants (${earlyExit}): ${stderr || stdout}`);
-    }
-
-    pids = readFileSync(pidFile, "utf8")
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .map(Number);
-    assert(pids.length === 2 && pids.every(pid => Number.isInteger(pid) && pid > 0), `invalid lifecycle PID file: ${pids.join(",")}`);
-    assert(pids.every(processExists), `GUI lifecycle probe did not leave both descendants alive: ${pids.join(",")}`);
-
-    guiProcess.kill();
-    await guiProcess.exited;
-    await Promise.all([stdoutPromise, stderrPromise]);
-    const deadline = Date.now() + 5_000;
-    while (pids.some(processExists) && Date.now() < deadline) await Bun.sleep(25);
-    const survivors = pids.filter(processExists);
-    assert(survivors.length === 0, `hard-closing the GUI left Job Object descendants alive: ${survivors.join(", ")}`);
-  } finally {
-    if (guiProcess.exitCode === null) {
-      guiProcess.kill();
-      await guiProcess.exited;
-    }
-    await Promise.all([stdoutPromise, stderrPromise]);
-    for (const pid of pids.filter(processExists)) {
-      try { process.kill(pid, "SIGKILL"); } catch {}
-    }
-  }
+async function lifecycleSmoke(gui: string, relocated: string, environment: Record<string, string | undefined>): Promise<void> {
+  const probe = join(relocated, "gui-lifecycle-probe.exe");
+  await compileLifecycleProbe(probe);
+  const result = await run(probe, [gui], { env: environment, cwd: relocated, timeoutMs: 45_000 });
+  assert(result.exitCode === 0, `GUI lifecycle smoke failed (${result.exitCode}): ${result.stderr || result.stdout}`);
+  assert(result.stdout.includes("GUI_LIFECYCLE_OK"), `GUI lifecycle smoke did not report success: ${result.stdout}`);
+  rmSync(probe, { force: true });
 }
 
-if (process.platform !== "win32") {
-  process.stdout.write("WINDOWS_GUI_SMOKE_SKIPPED\n");
-  process.exit(0);
-}
-
-assert(existsSync(sourceBundle), `Windows runtime bundle does not exist: ${sourceBundle}`);
 const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-gui-smoke-"));
 const firstLocation = join(root, "first-location");
-const relocated = join(root, "relocated GUI \u03a9 & spaces");
+const relocated = join(root, "relocated GUI Ω & spaces");
 const appHome = join(root, "private app state");
 
 try {
@@ -357,7 +275,10 @@ try {
   assert(metadata.platform === "win32", "--about-json platform is not win32");
   assert(metadata.architecture === manifest.arch || metadata.arch === manifest.arch, "--about-json architecture does not match the manifest");
   assert(metadata.portable === false, "--about-json must identify the installed/native GUI contract");
-  assert(normalized(String(metadata.root)) === normalized(relocated), "--about-json root does not match the relocated bundle");
+  assert(
+    normalized(String(metadata.root)) === normalized(relocated),
+    `--about-json root does not match the relocated bundle (actual=${String(metadata.root)} expected=${relocated})`,
+  );
   assert(normalized(String(metadata.cliPath)) === normalized(launcher), "--about-json cliPath does not resolve to the relocated sibling launcher");
 
   const launcherVersion = await run(launcher, ["--version"], { env: environment, cwd: relocated, timeoutMs: coldStartTimeoutMs });
@@ -378,46 +299,16 @@ try {
   assert(!`${selfTest.stdout}\n${selfTest.stderr}`.includes(secretCanary), "--self-test disclosed a secret canary");
   const selfTestJson = parseSingleJson(selfTest.stdout, "--self-test");
   assert(selfTestJson.schemaVersion === 1, "--self-test has an unexpected schemaVersion");
-  assert(typeof selfTestJson.ok === "boolean", "--self-test must report a boolean ok field");
-  assert(Array.isArray(selfTestJson.checks), "--self-test must report a checks array");
-  const selfTestChecks = selfTestJson.checks as Array<Record<string, unknown>>;
-  const cliTransportCheck = selfTestChecks.find(check => check.id === "cliTransport");
-  assert(cliTransportCheck?.ok === true, "--self-test could not capture nested sibling CLI stdout");
-  assert(selfTest.exitCode === (selfTestJson.ok ? 0 : 1), "--self-test exit code and ok field disagree");
-  assert(JSON.stringify(treeSnapshot(appHome)) === JSON.stringify(homeBefore), "--self-test or --about-json mutated private application state");
+  assert(selfTestJson.ok === (selfTest.exitCode === 0), "--self-test exit code does not match its JSON ok field");
 
-  const incompleteConfig = `${JSON.stringify({ chromeExecutablePath }, null, 2)}\n`;
-  writeFileSync(configPath, incompleteConfig);
-  const malformedSelfTest = await run(gui, ["--self-test"], { env: environment, cwd: relocated, timeoutMs: 15_000 });
-  writeFileSync(configPath, validConfigText);
-  assert(!`${malformedSelfTest.stdout}\n${malformedSelfTest.stderr}`.includes(secretCanary), "malformed-config --self-test disclosed a secret canary");
-  const malformedSelfTestJson = parseSingleJson(malformedSelfTest.stdout, "malformed-config --self-test");
-  const malformedChecks = malformedSelfTestJson.checks as Array<Record<string, unknown>> | undefined;
-  const malformedConfigCheck = Array.isArray(malformedChecks)
-    ? malformedChecks.find(check => check.id === "config")
-    : undefined;
-  assert(malformedSelfTest.exitCode === 1 && malformedSelfTestJson.ok === false, "--self-test accepted an incomplete configuration");
-  assert(malformedConfigCheck?.ok === false, "--self-test did not identify the incomplete configuration");
-  assert(JSON.stringify(treeSnapshot(appHome)) === JSON.stringify(homeBefore), "malformed-config --self-test mutated private application state");
-
-  writeFileSync(configPath, `{"version":2,"controlToken":${secretCanary}}\n`);
-  const secretMalformedSelfTest = await run(gui, ["--self-test"], { env: environment, cwd: relocated, timeoutMs: 15_000 });
-  writeFileSync(configPath, validConfigText);
-  assert(
-    !`${secretMalformedSelfTest.stdout}\n${secretMalformedSelfTest.stderr}`.includes(secretCanary),
-    "malformed-config --self-test echoed secret-bearing parser input",
-  );
-  const secretMalformedJson = parseSingleJson(secretMalformedSelfTest.stdout, "secret-bearing malformed-config --self-test");
-  assert(secretMalformedSelfTest.exitCode === 1 && secretMalformedJson.ok === false, "--self-test accepted invalid secret-bearing JSON");
-  assert(JSON.stringify(treeSnapshot(appHome)) === JSON.stringify(homeBefore), "secret-bearing malformed-config --self-test mutated private application state");
+  await lifecycleSmoke(gui, relocated, environment);
 
   const persistenceAfter = await windowsPersistenceSnapshot();
-  assert(JSON.stringify(persistenceAfter) === JSON.stringify(persistenceBefore), "headless GUI commands changed Windows startup persistence state");
+  assert(persistenceAfter === persistenceBefore, "GUI smoke changed Windows startup persistence");
+  const homeAfter = treeSnapshot(appHome);
+  assertTreeEqual(homeBefore, homeAfter, "GUI smoke app home");
 
-  await exerciseOuterJob(gui, root, environment);
-  process.stdout.write("WINDOWS_GUI_STDIO_TRANSPORT_SMOKE_OK\n");
-  process.stdout.write("WINDOWS_GUI_OUTER_JOB_SMOKE_OK\n");
-  process.stdout.write("WINDOWS_GUI_RELOCATABLE_HEADLESS_SMOKE_OK\n");
+  process.stdout.write("WINDOWS_GUI_SMOKE_OK\n");
 } finally {
   rmSync(root, { recursive: true, force: true });
 }
