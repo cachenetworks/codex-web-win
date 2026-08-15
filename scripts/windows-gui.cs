@@ -865,7 +865,7 @@ internal sealed class MainWindow : Form
         options.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         options.Controls.Add(FieldLabel("Connector name", 20, 31));
         appName = FieldBox(150, 27, 250, false);
-        appName.Text = "Codex Native";
+        appName.Text = "Codex Native " + Environment.MachineName;
         options.Controls.Add(appName);
         options.Controls.Add(FieldLabel("Port", 430, 31));
         port = new NumericUpDown();
@@ -1448,7 +1448,7 @@ internal sealed class MainWindow : Form
         AppendJsonBoolean(payload, "replaceCodexRoute", replaceRoute.Checked);
         payload.Append(",\"port\":").Append(((int)port.Value).ToString(CultureInfo.InvariantCulture));
         if (!String.IsNullOrWhiteSpace(chromePath.Text)) AppendJsonPair(payload, "chromeExecutablePath", chromePath.Text.Trim(), false);
-        AppendJsonPair(payload, "appName", String.IsNullOrWhiteSpace(appName.Text) ? "Codex Native" : appName.Text.Trim(), false);
+        AppendJsonPair(payload, "appName", String.IsNullOrWhiteSpace(appName.Text) ? "Codex Native " + Environment.MachineName : appName.Text.Trim(), false);
         if (requestedFullMode)
         {
             if (!String.IsNullOrWhiteSpace(tunnelId.Text))
