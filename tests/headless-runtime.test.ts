@@ -20,6 +20,12 @@ describe("Chrome visibility policy", () => {
     expect(setupSource).toContain("config.headed = false;");
   });
 
+  test("runtime provider forces headless even for older saved configs", () => {
+    const configSource = source("src/config.ts");
+    expect(configSource).toContain("headed: false,");
+    expect(configSource).not.toContain("headed: config.headed,");
+  });
+
   test("runtime worker maps headed=false to Playwright headless=true", () => {
     const workerSource = source("src/adapters/chatgpt-web/browser-worker.ts");
     expect(workerSource).toContain("headless: !this.config.headed");
