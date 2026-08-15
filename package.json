@@ -72,7 +72,6 @@
     "chatgpt",
     "responses-api",
     "mcp",
-    "openai",
     "playwright"
   ],
   "license": "MIT"
