@@ -110,6 +110,16 @@ function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
     if (namespace) tool.namespace = namespace;
     out.push(tool);
   };
+  const pushCustom = (t: Record<string, unknown>, namespace?: string) => {
+    const tool: CodexTool = {
+      name: t.name as string,
+      description: (t.description as string) ?? "",
+      parameters: { type: "object", properties: { input: { type: "string", description: "Raw tool input. For apply_patch, begin exactly with `*** Begin Patch` (no trailing `***`), then use its standard patch envelope." } }, required: ["input"] },
+      freeform: true,
+    };
+    if (namespace) tool.namespace = namespace;
+    out.push(tool);
+  };
   for (const t of tools) {
     if (!isObj(t)) continue;
     if (t.type === "function" && typeof t.name === "string") {
@@ -119,7 +129,9 @@ function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
       // chat-completions models receive them (round-trip restores the namespace in the bridge).
       const ns = typeof t.name === "string" ? t.name : undefined;
       for (const inner of t.tools as unknown[]) {
-        if (isObj(inner) && inner.type === "function" && typeof inner.name === "string") pushFn(inner, ns);
+        if (!isObj(inner) || typeof inner.name !== "string") continue;
+        if (inner.type === "function") pushFn(inner, ns);
+        else if (inner.type === "custom") pushCustom(inner, ns);
       }
     }
     else if (t.type === "custom" && typeof t.name === "string") {

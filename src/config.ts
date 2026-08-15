@@ -1,12 +1,20 @@
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, openSync, closeSync, renameSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
-import { tmpdir } from "node:os";
 import type { CodexProviderConfig } from "./types";
 import { VERSION } from "./version";
 
 export type RuntimeMode = "browser-only" | "full";
+
+export function defaultAppName(machineName = hostname()): string {
+  const suffix = machineName
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return suffix ? `Codex Native ${suffix}` : "Codex Native";
+}
 
 export interface TunnelConfig {
   binaryPath: string;
@@ -107,7 +115,10 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     host: "127.0.0.1",
     port: 17841,
     contextWindow: 256_000,
-    appName: "Codex Native",
+    // A machine-specific connector name prevents one ChatGPT account from
+    // silently selecting another computer's Full-mode tunnel. Existing configs
+    // retain their configured name; this affects fresh setups only.
+    appName: defaultAppName(),
     chromeExecutablePath: defaultChromeExecutable(),
     storageStatePath: join(home, "browser", "storage-state.json"),
     brokerSocketPath: defaultBrokerSocketPath(),

@@ -87,6 +87,21 @@ function exactTool(environment: ChatGptTurnEnvironment, name: string): CodexTool
   return environment.tools.find(tool => !tool.namespace && tool.name === name);
 }
 
+/**
+ * Native Codex function tools have historically been advertised either at the
+ * top level or under the built-in `functions` namespace. Treat those two wire
+ * shapes as equivalent for the dedicated bridge wrappers. Arbitrary MCP/app
+ * namespaces stay isolated so a third-party tool cannot accidentally satisfy a
+ * native capability check merely by reusing a name such as `exec_command`.
+ */
+function nativeFunctionTool(environment: ChatGptTurnEnvironment, name: string): CodexTool | undefined {
+  return environment.tools.find(tool => (
+    tool.name === name
+    && tool.freeform !== true
+    && (!tool.namespace || tool.namespace === "functions")
+  ));
+}
+
 function namedTool(environment: ChatGptTurnEnvironment, requestedWireName: string): CodexTool {
   const tool = environment.tools.find(candidate => wireName(candidate) === requestedWireName);
   if (!tool) throw new Error(`Codex tool is not available in this turn: ${requestedWireName}`);
@@ -111,8 +126,14 @@ function asMcpResult(value: BrokerToolResult) {
 }
 
 function execGateway(environment: ChatGptTurnEnvironment): CodexTool | undefined {
-  const tool = exactTool(environment, "exec");
-  return tool?.freeform ? tool : undefined;
+  // Responses Lite may advertise the built-in freeform gateway either at the
+  // top level or inside the default `functions` namespace. Do not accept an
+  // arbitrary app/MCP namespace merely because it also contains `exec`.
+  return environment.tools.find(tool => (
+    tool.name === "exec"
+    && tool.freeform === true
+    && (!tool.namespace || tool.namespace === "functions")
+  ));
 }
 
 export interface GatewayNestedTool {
@@ -221,8 +242,8 @@ export function resolveCommandToolNameFromInventory(
   environment: ChatGptTurnEnvironment,
   nestedTools: GatewayNestedTool[],
 ): "exec_command" | "shell_command" | undefined {
-  if (exactTool(environment, "exec_command")) return "exec_command";
-  if (exactTool(environment, "shell_command")) return "shell_command";
+  if (nativeFunctionTool(environment, "exec_command")) return "exec_command";
+  if (nativeFunctionTool(environment, "shell_command")) return "shell_command";
   if (nestedTools.some(tool => tool.wireName === "exec_command")) return "exec_command";
   if (nestedTools.some(tool => tool.wireName === "shell_command")) return "shell_command";
   return undefined;
@@ -238,8 +259,8 @@ export function resolveSessionContinuationToolNameFromInventory(
   environment: ChatGptTurnEnvironment,
   nestedTools: GatewayNestedTool[],
 ): "write_stdin" | "wait" | undefined {
-  if (exactTool(environment, "write_stdin")) return "write_stdin";
-  if (exactTool(environment, "wait")) return "wait";
+  if (nativeFunctionTool(environment, "write_stdin")) return "write_stdin";
+  if (nativeFunctionTool(environment, "wait")) return "wait";
   if (nestedTools.some(tool => tool.wireName === "write_stdin")) return "write_stdin";
   if (nestedTools.some(tool => tool.wireName === "wait")) return "wait";
   return undefined;
@@ -317,6 +338,7 @@ export function execGatewayCommandProgram(options: {
   maxOutputTokens?: number;
   tty?: boolean;
 }): string {
+  const continuationOutputTokens = options.maxOutputTokens ?? 10_000;
   const execArguments = {
     cmd: options.cmd,
     ...(options.workdir ? { workdir: options.workdir } : {}),
@@ -340,7 +362,26 @@ export function execGatewayCommandProgram(options: {
     "const commandName = commandNames.has(\"exec_command\") ? \"exec_command\" : commandNames.has(\"shell_command\") ? \"shell_command\" : undefined;",
     "if (!commandName) throw new Error(\"This Codex turn has no exec_command or shell_command in the native exec gateway\");",
     `const commandArguments = commandName === "exec_command" ? ${JSON.stringify(execArguments)} : ${JSON.stringify(shellArguments)};`,
-    "const result = await tools[commandName](commandArguments);",
+    "let commandResult = await tools[commandName](commandArguments);",
+    "const commandOutput = [];",
+    "const captureCommandOutput = value => {",
+    "  if (value && typeof value === \"object\" && typeof value.output === \"string\" && value.output.length > 0) commandOutput.push(value.output);",
+    "};",
+    "captureCommandOutput(commandResult);",
+    "while (commandResult && typeof commandResult === \"object\" && commandResult.session_id !== undefined) {",
+    "  const commandSessionId = commandResult.session_id;",
+    "  if (commandNames.has(\"write_stdin\")) {",
+    `    commandResult = await tools.write_stdin({ session_id: commandSessionId, chars: "", yield_time_ms: 30000, max_output_tokens: ${continuationOutputTokens} });`,
+    "  } else if (commandNames.has(\"wait\")) {",
+    `    commandResult = await tools.wait({ cell_id: String(commandSessionId), yield_time_ms: 30000, max_tokens: ${continuationOutputTokens} });`,
+    "  } else {",
+    "    throw new Error(\"Native command yielded a session but the exec gateway exposes no write_stdin/wait continuation tool\");",
+    "  }",
+    "  captureCommandOutput(commandResult);",
+    "}",
+    "const result = commandOutput.length > 0 && commandResult && typeof commandResult === \"object\"",
+    "  ? { ...commandResult, output: commandOutput.join(\"\") }",
+    "  : commandResult;",
     "const emit = value => {",
     "  if (Array.isArray(value)) { for (const item of value) emit(item); return; }",
     "  if (value && typeof value === \"object\") {",
@@ -557,7 +598,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       }
       rememberOwnedCapability(ownedTurnTokens, turn_token, claimed.environment.expiresAt);
       rememberOwnedCapability(ownedBindingIds, claimed.bindingId, claimed.environment.expiresAt);
-      const commandTool = exactTool(claimed.environment, "exec_command") ?? exactTool(claimed.environment, "shell_command");
+      const commandTool = nativeFunctionTool(claimed.environment, "exec_command") ?? nativeFunctionTool(claimed.environment, "shell_command");
       const gateway = execGateway(claimed.environment);
       // Keep binding a pure ownership/capability handshake. Live ALL_TOOLS
       // discovery can execute a nested native round and previously made the
@@ -571,18 +612,21 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
         .map(tool => tool.wireName)
         .filter(name => !directToolNames.has(name)));
       const hasWireTool = (name: string) => directToolNames.has(name) || nestedToolNames.has(name);
+      const hasNativeFunction = (name: string) => Boolean(
+        nativeFunctionTool(claimed.environment, name) ?? discovered.find(tool => tool.wireName === name),
+      );
       const capabilities = ["native_tool_loop", "tool_registry"];
       // The exec gateway can defer its nested registry instead of spelling every
       // tool out in its markdown description. The dedicated wrappers discover
       // command/apply-patch tools inside that gateway at invocation time, so do
       // not make the web model incorrectly conclude that local work is impossible.
       if (commandToolName || gateway) capabilities.push("exec");
-      if (hasWireTool("write_stdin") || hasWireTool("wait")) capabilities.push("session_history");
-      if (hasWireTool("wait")) capabilities.push("session_termination");
+      if (hasNativeFunction("write_stdin") || hasNativeFunction("wait")) capabilities.push("session_history");
+      if (hasNativeFunction("wait")) capabilities.push("session_termination");
       if (hasWireTool("apply_patch") || gateway) capabilities.push("apply_patch");
-      if (hasWireTool("view_image")) capabilities.push("images");
-      if (hasWireTool("request_user_input")) capabilities.push("user_input");
-      if (hasWireTool("update_plan")) capabilities.push("planning");
+      if (hasNativeFunction("view_image")) capabilities.push("images");
+      if (hasNativeFunction("request_user_input")) capabilities.push("user_input");
+      if (hasNativeFunction("update_plan")) capabilities.push("planning");
       if (hasWireTool("web__run")) capabilities.push("web");
       if (hasWireTool("list_mcp_resources") && hasWireTool("read_mcp_resource")) capabilities.push("mcp_resources");
       if (hasWireTool("collaboration__spawn_agent")) capabilities.push("collaboration");
@@ -633,7 +677,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     async ({ binding_id, cmd, workdir, yield_time_ms, timeout_ms, max_output_tokens, tty }, extra) => {
       console.error(`[chatgpt-web-mcp] codex_exec scope=${requestScopeSummary(extra)}`);
       const bound = await environment(binding_id, extra);
-      const tool = exactTool(bound, "exec_command") ?? exactTool(bound, "shell_command");
+      const tool = nativeFunctionTool(bound, "exec_command") ?? nativeFunctionTool(bound, "shell_command");
       if (tool) {
         const args = tool.name === "exec_command"
           ? {
@@ -688,8 +732,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     },
     async ({ binding_id, session_id, chars, yield_time_ms, max_output_tokens, terminate }, extra) => {
       const bound = await environment(binding_id, extra);
-      const tool = exactTool(bound, "write_stdin");
-      const directWait = tool ? undefined : exactTool(bound, "wait");
+      const tool = nativeFunctionTool(bound, "write_stdin");
+      const directWait = tool ? undefined : nativeFunctionTool(bound, "wait");
       const declared = tool || directWait ? [] : gatewayNestedTools(bound);
       const declaredContinuation = tool || directWait
         ? undefined
@@ -766,7 +810,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     },
     async ({ binding_id, path, detail }, extra) => {
       const bound = await environment(binding_id, extra);
-      const tool = exactTool(bound, "view_image");
+      const tool = nativeFunctionTool(bound, "view_image");
       const payload = { arguments: { path, ...(detail ? { detail } : {}) } };
       return tool
         ? invokeNative(binding_id, bound, tool, payload)

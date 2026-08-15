@@ -169,6 +169,14 @@ export async function runDoctor(): Promise<DoctorReport> {
         detail: "These calls belong to a different broker ownership epoch. They can be stale in-flight calls after a local tunnel/MCP restart, or traffic from another computer using the same tunnel. If they persist without a restart, verify each computer has its own tunnel ID and uniquely named ChatGPT custom app/connector.",
       });
     }
+    if (config.appName === "Codex Native") {
+      checks.push({
+        id: "connector-machine-name",
+        status: "warning",
+        message: "Full mode is using the legacy generic connector name \"Codex Native\"",
+        detail: "If this ChatGPT account is used with Full mode on more than one computer, give every computer a unique connector name and its own tunnel ID. Fresh installs now default to a machine-specific connector name.",
+      });
+    }
     checks.push({
       id: "connector",
       status: "warning",
