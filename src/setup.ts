@@ -137,6 +137,9 @@ function baseConfig(existing: AppConfig | undefined, options: SetupOptions): App
   config.mode = options.mode;
   config.releaseVersion = VERSION;
   config.runtimeCommand = currentRuntimeCommand();
+  // Setup/login remains visibly headed, but all normal ChatGPT browser work after
+  // setup is forced headless through the persisted provider configuration.
+  config.headed = false;
   if (options.port !== undefined) {
     if (!Number.isInteger(options.port) || options.port < 1 || options.port > 65_535) throw new Error("--port must be an integer from 1 to 65535");
     config.port = options.port;
