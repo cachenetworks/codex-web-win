@@ -122,7 +122,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     chromeExecutablePath: defaultChromeExecutable(),
     storageStatePath: join(home, "browser", "storage-state.json"),
     brokerSocketPath: defaultBrokerSocketPath(),
-    headed: true,
+    headed: false,
     proAvailable: false,
     autoApproveToolCalls: false,
     controlToken: randomBytes(32).toString("base64url"),
@@ -326,7 +326,9 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       chromeExecutablePath: config.chromeExecutablePath,
       brokerSocketPath: config.brokerSocketPath,
       threadEnvironmentStatePath: join(getConfigDir(), "runtime", "thread-environments.json"),
-      headed: config.headed,
+      // Runtime automation is always headless. Interactive setup/login uses the
+      // dedicated visible Chrome path in browser-login.ts and is unaffected.
+      headed: false,
       localToolsEnabled: config.mode === "full",
       proAvailable: config.proAvailable,
       autoApproveToolCalls: config.autoApproveToolCalls,
