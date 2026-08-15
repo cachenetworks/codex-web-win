@@ -138,18 +138,16 @@ export function shellCommandInvocationArgs(options: {
 }): Record<string, unknown> {
   // `shell_command.timeout_ms` is a hard runtime deadline, while Codex's
   // `yield_time_ms` is only a request to hand back a resumable session early.
-  // Treating a 1s yield as a 1s timeout kills perfectly healthy builds/tests.
-  // Preserve the shell tool's normal 10s default for short yields and expose an
-  // explicit timeout for harnesses that do not have a native write_stdin/session
-  // capability.
-  const timeoutMs = options.timeoutMs
-    ?? (options.resumable
-      ? 300_000
-      : options.yieldTimeMs !== undefined ? Math.max(10_000, options.yieldTimeMs) : undefined);
+  // A yield request must never shorten the command lifetime. Older Windows
+  // harnesses expose `shell_command` without a resumable wait cell and otherwise
+  // inherit a very short native timeout, which makes healthy builds look frozen
+  // or fail at roughly the requested yield interval. Use the bridge's maximum
+  // command budget unless the caller explicitly supplied a hard deadline.
+  const timeoutMs = options.timeoutMs ?? 300_000;
   return {
     command: options.cmd,
     ...(options.workdir ? { workdir: options.workdir } : {}),
-    ...(timeoutMs !== undefined ? { timeout_ms: timeoutMs } : {}),
+    timeout_ms: timeoutMs,
   };
 }
 
@@ -311,6 +309,55 @@ export function execGatewayProgram(
   ].join("\n");
 }
 
+export function execGatewayCommandProgram(options: {
+  cmd: string;
+  workdir?: string;
+  yieldTimeMs?: number;
+  timeoutMs?: number;
+  maxOutputTokens?: number;
+  tty?: boolean;
+}): string {
+  const execArguments = {
+    cmd: options.cmd,
+    ...(options.workdir ? { workdir: options.workdir } : {}),
+    ...(options.yieldTimeMs !== undefined ? { yield_time_ms: options.yieldTimeMs } : {}),
+    ...(options.maxOutputTokens !== undefined ? { max_output_tokens: options.maxOutputTokens } : {}),
+    ...(options.tty !== undefined ? { tty: options.tty } : {}),
+  };
+  const shellArguments = shellCommandInvocationArgs({
+    cmd: options.cmd,
+    ...(options.workdir ? { workdir: options.workdir } : {}),
+    ...(options.yieldTimeMs !== undefined ? { yieldTimeMs: options.yieldTimeMs } : {}),
+    ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+  });
+  const execOptions = {
+    ...(options.yieldTimeMs !== undefined ? { yield_time_ms: options.yieldTimeMs } : {}),
+    ...(options.maxOutputTokens !== undefined ? { max_output_tokens: options.maxOutputTokens } : {}),
+  };
+  return [
+    ...(Object.keys(execOptions).length > 0 ? [`// @exec: ${JSON.stringify(execOptions)}`] : []),
+    "const commandNames = new Set(ALL_TOOLS.map(tool => tool.name));",
+    "const commandName = commandNames.has(\"exec_command\") ? \"exec_command\" : commandNames.has(\"shell_command\") ? \"shell_command\" : undefined;",
+    "if (!commandName) throw new Error(\"This Codex turn has no exec_command or shell_command in the native exec gateway\");",
+    `const commandArguments = commandName === "exec_command" ? ${JSON.stringify(execArguments)} : ${JSON.stringify(shellArguments)};`,
+    "const result = await tools[commandName](commandArguments);",
+    "const emit = value => {",
+    "  if (Array.isArray(value)) { for (const item of value) emit(item); return; }",
+    "  if (value && typeof value === \"object\") {",
+    "    if (value.type === \"image\") { image(value); return; }",
+    "    if (value.type === \"audio\") { audio(value); return; }",
+    "    if (value.type === \"text\" && typeof value.text === \"string\") { text(value.text); return; }",
+    "    if (typeof value.image_url === \"string\" && typeof value.output_hint === \"string\") { generatedImage(value); return; }",
+    "    if (typeof value.image_url === \"string\") { image(value.image_url, value.detail ?? \"auto\"); return; }",
+    "    if (typeof value.audio_url === \"string\") { audio(value.audio_url); return; }",
+    "    if (Array.isArray(value.content)) { for (const item of value.content) emit(item); return; }",
+    "  }",
+    "  text(value);",
+    "};",
+    "emit(result);",
+  ].join("\n");
+}
+
 export function waitCellInvocationArgs(options: {
   sessionId: string | number;
   yieldTimeMs?: number;
@@ -375,8 +422,9 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     return new Error(
       `${SHARED_TUNNEL_ROUTE_MISS}: this tunnel-client process does not own the Codex turn for scope=${scopeKey ?? "unknown"}. `
       + "Retry the exact same Codex Native tool call unchanged; a fresh tunnel command can be claimed by the owning redundant poller. "
-      + "Do not regenerate or alter turn_token or binding_id. If repeated misses persist, another computer is probably polling the same tunnel; "
-      + "each concurrently running computer needs its own tunnel ID and uniquely named ChatGPT custom app/connector.",
+      + "Do not regenerate or alter turn_token or binding_id. A miss immediately after a local tunnel/MCP restart can be a stale in-flight call; "
+      + "if repeated misses persist without a restart, verify that no other computer is polling this tunnel. Each concurrently running computer "
+      + "still needs its own tunnel ID and uniquely named ChatGPT custom app/connector.",
     );
   };
 
@@ -524,10 +572,14 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
         .filter(name => !directToolNames.has(name)));
       const hasWireTool = (name: string) => directToolNames.has(name) || nestedToolNames.has(name);
       const capabilities = ["native_tool_loop", "tool_registry"];
-      if (commandToolName) capabilities.push("exec");
+      // The exec gateway can defer its nested registry instead of spelling every
+      // tool out in its markdown description. The dedicated wrappers discover
+      // command/apply-patch tools inside that gateway at invocation time, so do
+      // not make the web model incorrectly conclude that local work is impossible.
+      if (commandToolName || gateway) capabilities.push("exec");
       if (hasWireTool("write_stdin") || hasWireTool("wait")) capabilities.push("session_history");
       if (hasWireTool("wait")) capabilities.push("session_termination");
-      if (hasWireTool("apply_patch")) capabilities.push("apply_patch");
+      if (hasWireTool("apply_patch") || gateway) capabilities.push("apply_patch");
       if (hasWireTool("view_image")) capabilities.push("images");
       if (hasWireTool("request_user_input")) capabilities.push("user_input");
       if (hasWireTool("update_plan")) capabilities.push("planning");
@@ -547,7 +599,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
         tool_count: directToolNames.size + nestedToolNames.size,
         direct_tool_count: directToolNames.size,
         nested_tool_count: nestedToolNames.size,
-        command_tool: commandTool ? wireName(commandTool) : commandToolName ?? null,
+        command_tool: commandTool ? wireName(commandTool) : commandToolName ?? (gateway ? "deferred" : null),
         outer_tool_gateway: gateway ? wireName(gateway) : null,
         capabilities,
       authorization: {
@@ -582,33 +634,39 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       console.error(`[chatgpt-web-mcp] codex_exec scope=${requestScopeSummary(extra)}`);
       const bound = await environment(binding_id, extra);
       const tool = exactTool(bound, "exec_command") ?? exactTool(bound, "shell_command");
-      const declared = tool ? [] : gatewayNestedTools(bound);
-      const declaredCommandName = tool?.name ?? resolveCommandToolNameFromInventory(bound, declared);
-      const discovered = tool || declaredCommandName ? declared : await discoverGatewayTools(binding_id, bound);
-      const commandName = tool?.name ?? resolveCommandToolNameFromInventory(bound, discovered);
-      if (!commandName) throw new Error("This Codex turn did not advertise exec_command, shell_command, or a compatible native exec gateway");
-      const nestedResumable = !tool && resolveSessionContinuationToolNameFromInventory(bound, discovered) !== undefined;
-      const args = commandName === "exec_command"
-        ? {
-            cmd,
-            ...(workdir ? { workdir } : {}),
-            ...(yield_time_ms !== undefined ? { yield_time_ms } : {}),
-            ...(max_output_tokens !== undefined ? { max_output_tokens } : {}),
-            ...(tty !== undefined ? { tty } : {}),
-          }
-        : shellCommandInvocationArgs({
-            cmd,
-            ...(workdir ? { workdir } : {}),
-            ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
-            ...(timeout_ms !== undefined ? { timeoutMs: timeout_ms } : {}),
-            ...(nestedResumable ? { resumable: true } : {}),
-          });
-      const response = tool
-        ? invokeNative(binding_id, bound, tool, { arguments: args })
-        : invokeNestedNative(binding_id, bound, commandName, false, { arguments: args }, {
-            ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
-            ...(max_output_tokens !== undefined ? { maxOutputTokens: max_output_tokens } : {}),
-          });
+      if (tool) {
+        const args = tool.name === "exec_command"
+          ? {
+              cmd,
+              ...(workdir ? { workdir } : {}),
+              ...(yield_time_ms !== undefined ? { yield_time_ms } : {}),
+              ...(max_output_tokens !== undefined ? { max_output_tokens } : {}),
+              ...(tty !== undefined ? { tty } : {}),
+            }
+          : shellCommandInvocationArgs({
+              cmd,
+              ...(workdir ? { workdir } : {}),
+              ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
+              ...(timeout_ms !== undefined ? { timeoutMs: timeout_ms } : {}),
+            });
+        return withYieldedSessionId(await invokeNative(binding_id, bound, tool, { arguments: args }));
+      }
+
+      const gateway = execGateway(bound);
+      if (!gateway) throw new Error("This Codex turn did not advertise exec_command, shell_command, or a compatible native exec gateway");
+      // Discover and execute in one native gateway round. This avoids a separate
+      // ALL_TOOLS probe whose failure used to erase command capability on some
+      // Windows harness/plugin combinations even though the command tool existed.
+      const response = invokeNative(binding_id, bound, gateway, {
+        input: execGatewayCommandProgram({
+          cmd,
+          ...(workdir ? { workdir } : {}),
+          ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
+          ...(timeout_ms !== undefined ? { timeoutMs: timeout_ms } : {}),
+          ...(max_output_tokens !== undefined ? { maxOutputTokens: max_output_tokens } : {}),
+          ...(tty !== undefined ? { tty } : {}),
+        }),
+      });
       return withYieldedSessionId(await response);
     },
   );
@@ -854,5 +912,18 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     },
   );
 
+  // tunnel-client owns this subprocess's stdio. During a tunnel recycle it can
+  // close stdout while an MCP response is in flight; Node otherwise treats the
+  // resulting EPIPE as an unhandled stream error and prints a crash stack. There
+  // is no usable transport after a broken pipe, so terminate cleanly and let the
+  // tunnel supervisor spawn a fresh MCP child for the next command.
+  const onStdoutError = (error: NodeJS.ErrnoException) => {
+    if (error.code === "EPIPE") process.exit(0);
+    throw error;
+  };
+  process.stdout.on("error", onStdoutError);
+  // `connect()` resolves once the transport is started; it does not represent
+  // the transport's full lifetime. Keep the listener installed for the process
+  // lifetime so a later dispatcher-side pipe close is handled as well.
   await server.connect(new StdioServerTransport());
 }

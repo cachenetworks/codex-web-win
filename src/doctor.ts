@@ -166,7 +166,7 @@ export async function runDoctor(): Promise<DoctorReport> {
         id: "shared-tunnel-routing",
         status: "warning",
         message: `Tunnel log contains ${sharedRouteMisses} recent shared-tunnel ownership miss${sharedRouteMisses === 1 ? "" : "es"}`,
-        detail: "This tunnel is receiving Codex Native calls for turns owned by another local broker. Do not run the same tunnel/ChatGPT connector concurrently on multiple computers; give each computer its own tunnel ID and uniquely named ChatGPT custom app/connector.",
+        detail: "These calls belong to a different broker ownership epoch. They can be stale in-flight calls after a local tunnel/MCP restart, or traffic from another computer using the same tunnel. If they persist without a restart, verify each computer has its own tunnel ID and uniquely named ChatGPT custom app/connector.",
       });
     }
     checks.push({
