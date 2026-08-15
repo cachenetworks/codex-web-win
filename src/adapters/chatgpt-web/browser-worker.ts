@@ -159,6 +159,7 @@ export interface ChatGptVisibleTraceEvent {
 interface ChatGptResponseDomSnapshot {
   responsePresent: boolean;
   visibleText: string;
+  visibleTextLength: number;
   fullHtml: string;
   stableHtml: string;
   completionActionVisible: boolean;
@@ -168,6 +169,7 @@ interface ChatGptResponseDomSnapshot {
 const absentResponseDomSnapshot = (): ChatGptResponseDomSnapshot => ({
   responsePresent: false,
   visibleText: "",
+  visibleTextLength: 0,
   fullHtml: "",
   stableHtml: "",
   completionActionVisible: false,
@@ -491,19 +493,28 @@ export class ChatGptBrowserWorker {
   }
 
   /**
-   * A Codex turn owns one isolated Temporary Chat document. Reusing the same
-   * ChatGPT SPA page can retain the previous transcript and autocomplete DOM,
-   * so an @app lookup may select stale UI from the preceding turn.
+   * A Codex turn owns one isolated Temporary Chat document. Reset the existing
+   * page to about:blank before navigating it to the next turn instead of opening
+   * a second page while the previous (potentially very large) transcript is
+   * still resident. That overlap can briefly double renderer memory and freeze
+   * low-memory Windows machines after long requests.
+   *
+   * The about:blank navigation creates a fresh document, so stale transcript and
+   * autocomplete DOM cannot leak into the next @app lookup.
    */
   private async pageForNewTurn(): Promise<Page> {
     const previous = await this.ensurePage();
     if (previous.url() === "about:blank") return previous;
-    const context = this.context;
-    if (!context) throw new Error("ChatGPT web browser context is unavailable");
-    const page = await context.newPage();
-    this.page = page;
-    await previous.close().catch(() => {});
-    return page;
+    try {
+      await previous.goto("about:blank", { waitUntil: "commit", timeout: 15_000 });
+      return previous;
+    } catch {
+      // A renderer can become unhealthy after a very large turn. If the cheap
+      // in-place reset fails, discard the browser before creating a replacement
+      // so the old renderer is not kept alive alongside the new one.
+      this.discardBrowser();
+      return this.ensurePage();
+    }
   }
 
   /**
@@ -519,31 +530,37 @@ export class ChatGptBrowserWorker {
       } catch {}
 
       const workQuota = page.getByText(/(?:out of|remaining).*Work usage|Work usage.*(?:reset|remaining)/i);
-      const quotaCount = await workQuota.count().catch(() => 0);
-      for (let index = 0; index < quotaCount; index++) {
-        if (await workQuota.nth(index).isVisible().catch(() => false)) return true;
-      }
+      const quotaVisible = await workQuota.evaluateAll(elements => elements.some(element => {
+        const html = element as HTMLElement;
+        const style = getComputedStyle(html);
+        const rect = html.getBoundingClientRect();
+        return style.display !== "none"
+          && style.visibility !== "hidden"
+          && style.opacity !== "0"
+          && rect.width > 0
+          && rect.height > 0;
+      })).catch(() => false);
+      if (quotaVisible) return true;
 
-      const controls = page.locator("button, [role='tab'], [role='radio']");
-      const count = await controls.count().catch(() => 0);
-      for (let index = 0; index < count; index++) {
-        const control = controls.nth(index);
-        if (!await control.isVisible().catch(() => false)) continue;
-        const state = await control.evaluate(element => {
-          const html = element as HTMLElement;
-          const text = (html.innerText || html.textContent || "").replace(/\s+/g, " ").trim();
-          const rect = html.getBoundingClientRect();
-          const selected = html.getAttribute("aria-selected") === "true"
-            || html.getAttribute("aria-pressed") === "true"
-            || html.getAttribute("data-state") === "active"
-            || html.getAttribute("data-state") === "checked";
-          return { text, selected, top: rect.top, bottom: rect.bottom };
-        }).catch(() => undefined);
-        if (state?.text === "Work" && state.selected && state.top >= 0 && state.bottom <= 350) {
-          return true;
-        }
-      }
-      return false;
+      // Evaluate the whole top-level control set in one browser round-trip. The
+      // previous per-element Playwright loop could make dozens of IPC calls on
+      // every new turn, which is disproportionately expensive on older CPUs.
+      return page.locator("button, [role='tab'], [role='radio']").evaluateAll(elements => elements.some(element => {
+        const html = element as HTMLElement;
+        const style = getComputedStyle(html);
+        const rect = html.getBoundingClientRect();
+        if (style.display === "none"
+          || style.visibility === "hidden"
+          || style.opacity === "0"
+          || rect.width <= 0
+          || rect.height <= 0) return false;
+        const text = (html.innerText || html.textContent || "").replace(/\s+/g, " ").trim();
+        const selected = html.getAttribute("aria-selected") === "true"
+          || html.getAttribute("aria-pressed") === "true"
+          || html.getAttribute("data-state") === "active"
+          || html.getAttribute("data-state") === "checked";
+        return text === "Work" && selected && rect.top >= 0 && rect.bottom <= 350;
+      })).catch(() => false);
     };
 
     const temporaryChatIsPresent = (): boolean => {
@@ -1740,9 +1757,9 @@ export class ChatGptBrowserWorker {
       };
 
       const rendered = [...root.querySelectorAll<HTMLElement>(".markdown")].at(-1);
-      const renderedChildren = rendered ? [...rendered.children] : [];
       const completionAction = [...root.querySelectorAll<HTMLElement>('button[aria-label="Copy response"]')]
         .find(visible);
+      const completionActionVisible = completionAction !== undefined;
       const candidates = new Map<HTMLElement, "markdown" | "status">();
       root.querySelectorAll<HTMLElement>(".markdown").forEach(candidate => candidates.set(candidate, "markdown"));
       root.querySelectorAll<HTMLElement>(
@@ -1762,17 +1779,37 @@ export class ChatGptBrowserWorker {
         .sort(([left], [right]) => left === right
           ? 0
           : left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1)
-        .map(([candidate, kind]) => ({ kind, text: (candidate.innerText ?? candidate.textContent ?? "").trim() }))
-        .filter(block => block.text.length > 0)
-        .filter((block, index, blocks) => (
-          blocks.findIndex(other => other.kind === block.kind && other.text === block.text) === index
-        ));
+        .map(([candidate, kind]) => ({
+          kind,
+          // The trailing Markdown root is the growing final answer. The trace
+          // tracker intentionally never emits it, so do not serialize its full
+          // text across the Playwright boundary every 250 ms. Keep an empty
+          // sentinel so tracker ordering/"last markdown" semantics stay exact.
+          text: candidate === rendered ? "" : (candidate.innerText ?? candidate.textContent ?? "").trim(),
+          finalAnswer: candidate === rendered,
+        }))
+        .filter(block => block.finalAnswer || block.text.length > 0)
+        .filter((block, index, blocks) => block.finalAnswer || (
+          blocks.findIndex(other => !other.finalAnswer && other.kind === block.kind && other.text === block.text) === index
+        ))
+        .map(({ kind, text }) => ({ kind, text }));
+      // Final-answer text/HTML is large and grows monotonically. It is only
+      // consumed once the response action is present, so defer all three large
+      // DOM serializations until that condition holds. This removes the main
+      // O(response-size × poll-count) IPC/GC cost on long requests.
+      const visibleText = completionActionVisible
+        ? (rendered?.innerText ?? rendered?.textContent ?? "").trim()
+        : "";
+      const renderedChildren = completionActionVisible && rendered ? [...rendered.children] : [];
       return {
         responsePresent: true,
-        visibleText: (rendered?.innerText ?? rendered?.textContent ?? "").trim(),
-        fullHtml: rendered?.innerHTML ?? "",
-        stableHtml: renderedChildren.slice(0, -1).map(child => child.outerHTML).join(""),
-        completionActionVisible: completionAction !== undefined,
+        visibleText,
+        visibleTextLength: visibleText.length,
+        fullHtml: completionActionVisible ? rendered?.innerHTML ?? "" : "",
+        stableHtml: completionActionVisible
+          ? renderedChildren.slice(0, -1).map(child => child.outerHTML).join("")
+          : "",
+        completionActionVisible,
         traceBlocks,
       };
     }, undefined, { timeout: 2_000 }).catch(() => absentResponseDomSnapshot());
@@ -1987,7 +2024,7 @@ export class ChatGptBrowserWorker {
               diagnosticError: error instanceof Error ? error.message : String(error),
             }));
             console.warn(
-              `[chatgpt-web] waiting for completed-turn evidence (running=${running}, sawRunning=${sawRunning}, textChars=${snapshot.visibleText.length}, completionActionVisible=${snapshot.completionActionVisible}, ui=${diagnostic})`,
+              `[chatgpt-web] waiting for completed-turn evidence (running=${running}, sawRunning=${sawRunning}, textChars=${snapshot.visibleTextLength}, completionActionVisible=${snapshot.completionActionVisible}, ui=${diagnostic})`,
             );
           }
         } else {

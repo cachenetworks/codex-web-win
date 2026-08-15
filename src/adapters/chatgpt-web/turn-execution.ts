@@ -80,11 +80,17 @@ interface TextWaiter {
 export class ChatGptTextFeed {
   private readonly queued: string[] = [];
   private readonly waiters = new Set<TextWaiter>();
-  private text = "";
+  private readonly textChunks: string[] = [];
+  private cachedText?: string;
 
   push(delta: string): void {
     if (!delta) return;
-    this.text += delta;
+    // Keep deltas as chunks while the browser is streaming. Repeatedly doing
+    // `text += delta` makes a long answer form an ever-growing string/rope that
+    // eventually has to be flattened; joining once at settlement is cheaper and
+    // keeps peak copying lower on memory-constrained machines.
+    this.textChunks.push(delta);
+    this.cachedText = undefined;
     this.queued.push(delta);
     const waiter = this.waiters.values().next().value as TextWaiter | undefined;
     if (!waiter) return;
@@ -98,7 +104,7 @@ export class ChatGptTextFeed {
   }
 
   value(): string {
-    return this.text;
+    return this.cachedText ??= this.textChunks.join("");
   }
 
   wait(signal?: AbortSignal): Promise<void> {
