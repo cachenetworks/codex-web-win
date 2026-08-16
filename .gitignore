@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Build and test output
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime state
+.codex/
+.codex-chatgpt-web/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.pid
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
