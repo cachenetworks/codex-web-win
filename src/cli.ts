@@ -29,6 +29,7 @@ import {
 } from "./tunnel";
 import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
+import { startHiddenRuntimeChromeWatcher } from "./windows-hidden-chrome";
 
 const HELP = `codex-chatgpt-web ${VERSION}
 
@@ -362,6 +363,9 @@ async function runForeground(config: ReturnType<typeof loadConfig>, ownTunnel: b
       initialAcceptingTurns: !waitsForTunnel,
     },
   );
+  const hiddenChromeWatcher = process.platform === "win32"
+    ? startHiddenRuntimeChromeWatcher()
+    : undefined;
   let tunnel: TunnelSession | undefined;
   let stoppingFor: NodeJS.Signals | "GUI" | undefined;
   try {
@@ -382,6 +386,7 @@ async function runForeground(config: ReturnType<typeof loadConfig>, ownTunnel: b
       server.stop(true),
       ...(tunnel ? [tunnel.stop()] : []),
     ]);
+    hiddenChromeWatcher?.stop();
     const failures = results
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map(result => result.reason instanceof Error ? result.reason.message : String(result.reason));

@@ -326,9 +326,11 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       chromeExecutablePath: config.chromeExecutablePath,
       brokerSocketPath: config.brokerSocketPath,
       threadEnvironmentStatePath: join(getConfigDir(), "runtime", "thread-environments.json"),
-      // Runtime automation is always headless. Interactive setup/login uses the
-      // dedicated visible Chrome path in browser-login.ts and is unaffected.
-      headed: false,
+      // Windows runtime uses real headed Chrome so anti-bot challenges see the
+      // same browser class as setup. The foreground session moves/minimizes only
+      // the Playwright-controlled window off-screen. Other platforms keep the
+      // existing headless behavior.
+      headed: process.platform === "win32",
       localToolsEnabled: config.mode === "full",
       proAvailable: config.proAvailable,
       autoApproveToolCalls: config.autoApproveToolCalls,
