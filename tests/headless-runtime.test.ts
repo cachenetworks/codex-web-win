@@ -15,18 +15,31 @@ describe("Chrome visibility policy", () => {
     expect(args.some(arg => arg === "--headless" || arg.startsWith("--headless="))).toBe(false);
   });
 
-  test("setup persists the runtime browser as headless", () => {
+  test("setup can keep its persisted headed flag false", () => {
     const setupSource = source("src/setup.ts");
     expect(setupSource).toContain("config.headed = false;");
   });
 
-  test("runtime provider forces headless even for older saved configs", () => {
+  test("Windows runtime provider forces real headed Chrome", () => {
     const configSource = source("src/config.ts");
-    expect(configSource).toContain("headed: false,");
-    expect(configSource).not.toContain("headed: config.headed,");
+    expect(configSource).toContain('headed: process.platform === "win32"');
+    expect(configSource).not.toContain("headed: false,\n      localToolsEnabled");
   });
 
-  test("runtime worker maps headed=false to Playwright headless=true", () => {
+  test("Windows foreground session starts the hidden runtime window watcher", () => {
+    const cliSource = source("src/cli.ts");
+    expect(cliSource).toContain('startHiddenRuntimeChromeWatcher');
+    expect(cliSource).toContain('process.platform === "win32"');
+  });
+
+  test("window watcher targets only Playwright Chrome and moves it off-screen", () => {
+    const watcherSource = source("src/windows-hidden-chrome.ts");
+    expect(watcherSource).toContain("--remote-debugging-pipe");
+    expect(watcherSource).toContain("-32000, -32000");
+    expect(watcherSource).toContain("$SW_MINIMIZE = 6");
+  });
+
+  test("browser worker still maps headed=true to Playwright headless=false", () => {
     const workerSource = source("src/adapters/chatgpt-web/browser-worker.ts");
     expect(workerSource).toContain("headless: !this.config.headed");
   });
